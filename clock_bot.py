@@ -84,6 +84,7 @@ def start(update, context):
             "📄 /check\n"
             "🧾 /PDF\n"
             "💵 /topup"
+            "📷 /viewclaims - View submitted claims"
         )
 
     update.message.reply_text(msg)
