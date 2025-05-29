@@ -1,6 +1,6 @@
 from flask import Flask, request
 from telegram import (
-    Bot, Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, BotCommand
+    Bot, Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 )
 from telegram.ext import (
     Dispatcher, CommandHandler, MessageHandler, Filters, ConversationHandler
@@ -10,7 +10,6 @@ import pytz
 import os
 import logging
 import traceback
-import telegram
 
 app = Flask(__name__)
 
@@ -33,15 +32,12 @@ driver_salaries = {}
 driver_accounts = {}
 topup_state = {}
 claim_state = {}
-fire_state = {}  # 存储解雇操作的状态
-fired_drivers = set()  # 存储已被解雇的司机ID
 
 tz = pytz.timezone("Asia/Kuala_Lumpur")
 
 # === conversation 状态 ===
 TOPUP_USER, TOPUP_AMOUNT = range(2)
 CLAIM_TYPE, CLAIM_OTHER_TYPE, CLAIM_AMOUNT, CLAIM_PROOF = range(4)
-FIRE_USER, FIRE_CONFIRM = range(2)  # 解雇流程状态
 
 # === 错误处理函数 ===
 def error_handler(update, context):
@@ -62,132 +58,40 @@ def error_handler(update, context):
     tb_string = ''.join(tb_list)
     logger.error(f"Full traceback:\n{tb_string}")
 
-# === 设置菜单命令 ===
-def set_user_commands(update, context):
-    """根据用户权限设置菜单命令"""
-    user_id = update.effective_user.id
-    
-    if user_id in ADMIN_IDS:
-        # 管理员命令
-        commands = [
-            BotCommand("clockin", "Clock in to start work"),
-            BotCommand("clockout", "Clock out to end work"),
-            BotCommand("offday", "Mark today as off day"),
-            BotCommand("claim", "Submit a claim for travel fund"),
-            BotCommand("help", "Show help information"),
-            BotCommand("balance", "View all balances (Admin)"),
-            BotCommand("check", "View all drivers' status (Admin)"),
-            BotCommand("topup", "Top up driver balance (Admin)"),
-            BotCommand("fire", "Fire a driver (Admin)")
-        ]
-    else:
-        # 普通用户命令
-        commands = [
-            BotCommand("clockin", "Clock in to start work"),
-            BotCommand("clockout", "Clock out to end work"),
-            BotCommand("offday", "Mark today as off day"),
-            BotCommand("claim", "Submit a claim for travel fund"),
-            BotCommand("help", "Show help information")
-        ]
-    
-    try:
-        context.bot.set_my_commands(commands)
-        logger.info(f"Commands set for user {user_id}")
-    except telegram.error.BadRequest as e:
-        logger.error(f"Bad request when setting commands: {str(e)}")
-    except Exception as e:
-        logger.error(f"Error setting commands: {str(e)}")
-
 # === /start ===
 def start(update, context):
     user = update.effective_user
     user_id = user.id
     username = user.username or str(user_id)
-    
-    # 检查是否已被解雇
-    if user_id in fired_drivers:
-        update.message.reply_text("🚫 You have been fired and no longer have access to this bot.")
-        return
-    
-    # 初始化数据结构
+
     driver_logs.setdefault(user_id, {})
     driver_salaries.setdefault(user_id, {"total_hours": 0.0, "daily_log": {}})
     driver_accounts.setdefault(user_id, {"balance": 0.0, "claims": []})
-    
-    # 设置用户菜单命令
-    set_user_commands(update, context)
-    
-    # 构建欢迎消息
+
     msg = (
         f"👋 Hello {user.first_name}!\n"
         "Welcome to Driver ClockIn Bot.\n\n"
         "Available Commands:\n"
-        "🕑 /clockin - Start work\n"
-        "🏁 /clockout - End work\n"
-        "📅 /offday - Mark off day\n"
-        "💸 /claim - Deduct from travel fund\n"
-        "❓ /help - Show help information"
+        "🕑 /clockin\n"
+        "🏁 /clockout\n"
+        "📅 /offday\n"
+        "💸 /claim"
     )
-
     if user_id in ADMIN_IDS:
         msg += (
             "\n\n🔐 Admin Commands:\n"
-            "📊 /balance - View all balances\n"
-            "📄 /check - View all drivers' status\n"
-            "💵 /topup - Top up driver balance\n"
-            "🔥 /fire - Fire a driver"
+            "📊 /balance\n"
+            "📄 /check\n"
+            "🧾 /PDF\n"
+            "💵 /topup"
         )
 
     update.message.reply_text(msg)
     logger.info(f"User {username} started the bot")
 
-# === /help ===
-def help_command(update, context):
-    user_id = update.effective_user.id
-    
-    # 检查是否已被解雇
-    if user_id in fired_drivers:
-        update.message.reply_text("🚫 You have been fired and no longer have access to this bot.")
-        return
-    
-    # 根据用户权限显示不同的帮助信息
-    if user_id in ADMIN_IDS:
-        msg = (
-            "🆘 Admin Help:\n\n"
-            "Basic Commands:\n"
-            "🕑 /clockin - Clock in to start work\n"
-            "🏁 /clockout - Clock out to end work\n"
-            "📅 /offday - Mark today as off day\n"
-            "💸 /claim - Submit a travel fund claim\n\n"
-            "Admin Commands:\n"
-            "📊 /balance - View all driver balances\n"
-            "📄 /check - View current driver status\n"
-            "💵 /topup - Add funds to a driver's account\n"
-            "🔥 /fire - Terminate a driver's employment\n\n"
-            "Type any command for more details."
-        )
-    else:
-        msg = (
-            "🆘 User Help:\n\n"
-            "Available Commands:\n"
-            "🕑 /clockin - Clock in to start work\n"
-            "🏁 /clockout - Clock out to end work\n"
-            "📅 /offday - Mark today as off day\n"
-            "💸 /claim - Submit a travel fund claim\n\n"
-            "Type any command for more details."
-        )
-    
-    update.message.reply_text(msg)
-
 # === /clockin ===
 def clockin(update, context):
     user_id = update.effective_user.id
-    
-    # 检查是否已被解雇
-    if user_id in fired_drivers:
-        update.message.reply_text("🚫 You have been fired and no longer have access to this bot.")
-        return
-    
     username = update.effective_user.username or str(user_id)
     now = datetime.datetime.now(tz)
     today = now.strftime("%Y-%m-%d")
@@ -200,14 +104,8 @@ def clockin(update, context):
 # === /clockout ===
 def clockout(update, context):
     user_id = update.effective_user.id
-    
-    # 检查是否已被解雇
-    if user_id in fired_drivers:
-        update.message.reply_text("🚫 You have been fired and no longer have access to this bot.")
-        return
-    
     username = update.effective_user.username or str(user_id)
-    now = datetime.datetime.now(tz)
+    now = datetime.datetime.now(tz)  # 修复：ttz -> tz
     today = now.strftime("%Y-%m-%d")
     clock_time = now.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -242,7 +140,7 @@ def clockout(update, context):
         
         # 计算小时和分钟
         hours = int(total_seconds // 3600)
-        minutes = int((total_seconds % 3600) // 60)
+        minutes = int((total_seconds % 3600) // 60)  # 修复：使用整除而不是取模
         
         # 格式化时间字符串
         if hours and minutes:
@@ -274,12 +172,6 @@ def clockout(update, context):
 # === /offday ===
 def offday(update, context):
     user_id = update.effective_user.id
-    
-    # 检查是否已被解雇
-    if user_id in fired_drivers:
-        update.message.reply_text("🚫 You have been fired and no longer have access to this bot.")
-        return
-    
     username = update.effective_user.username or str(user_id)
     today = datetime.datetime.now(tz).strftime("%Y-%m-%d")
     driver_logs.setdefault(user_id, {})[today] = {"in": "OFF", "out": "OFF"}
@@ -290,17 +182,12 @@ def offday(update, context):
 def balance(update, context):
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
-        update.message.reply_text("❌ You are not authorized to use this command.")
         return
     
     logger.info(f"Admin {user_id} requested balance")
     
     msg = "📊 Driver Balances:\n"
     for uid, acc in driver_accounts.items():
-        # 跳过已解雇的司机
-        if uid in fired_drivers:
-            continue
-            
         try:
             chat = bot.get_chat(uid)
             name = f"@{chat.username}" if chat.username else chat.first_name
@@ -315,7 +202,6 @@ def balance(update, context):
 def check(update, context):
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
-        update.message.reply_text("❌ You are not authorized to use this command.")
         return
     
     logger.info(f"Admin {user_id} requested check")
@@ -323,10 +209,6 @@ def check(update, context):
     today = datetime.datetime.now(tz).strftime("%Y-%m-%d")
     msg = "📄 Today's Status:\n"
     for uid, log in driver_logs.items():
-        # 跳过已解雇的司机
-        if uid in fired_drivers:
-            continue
-            
         day = log.get(today, {})
         in_time = day.get("in", "❌")
         out_time = day.get("out", "❌")
@@ -343,18 +225,13 @@ def check(update, context):
 def topup_start(update, context):
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
-        update.message.reply_text("❌ You are not authorized to use this command.")
-        return ConversationHandler.END
+        return
     
     logger.info(f"Admin {user_id} started topup process")
     
     keyboard = []
     topup_state[user_id] = {}
     for uid in driver_accounts:
-        # 跳过已解雇的司机
-        if uid in fired_drivers:
-            continue
-            
         try:
             chat = bot.get_chat(uid)
             name = f"@{chat.username}" if chat.username else chat.first_name
@@ -367,7 +244,7 @@ def topup_start(update, context):
             topup_state[user_id][name] = uid
 
     if not keyboard:
-        update.message.reply_text("❌ No active drivers found.")
+        update.message.reply_text("❌ No drivers found.")
         return ConversationHandler.END
 
     update.message.reply_text(
@@ -422,12 +299,6 @@ def topup_amount(update, context):
 # === /claim 分阶段 ===
 def claim_start(update, context):
     user_id = update.effective_user.id
-    
-    # 检查是否已被解雇
-    if user_id in fired_drivers:
-        update.message.reply_text("🚫 You have been fired and no longer have access to this bot.")
-        return ConversationHandler.END
-    
     username = update.effective_user.username or str(user_id)
     
     logger.info(f"User {username} started claim process")
@@ -519,108 +390,6 @@ def claim_proof(update, context):
     
     return ConversationHandler.END
 
-# === /fire (管理员专用) ===
-def fire_start(update, context):
-    user_id = update.effective_user.id
-    if user_id not in ADMIN_IDS:
-        update.message.reply_text("❌ You are not authorized to use this command.")
-        return ConversationHandler.END
-    
-    logger.info(f"Admin {user_id} started fire process")
-    
-    keyboard = []
-    fire_state[user_id] = {}
-    for uid in driver_accounts:
-        # 跳过管理员和已解雇的司机
-        if uid in ADMIN_IDS or uid in fired_drivers:
-            continue
-            
-        try:
-            chat = bot.get_chat(uid)
-            name = f"@{chat.username}" if chat.username else chat.first_name
-            keyboard.append([name])
-            fire_state[user_id][name] = uid
-        except Exception as e:
-            logger.error(f"Error getting chat for user {uid}: {str(e)}")
-            name = f"User {uid}"
-            keyboard.append([name])
-            fire_state[user_id][name] = uid
-
-    if not keyboard:
-        update.message.reply_text("❌ No active drivers found.")
-        return ConversationHandler.END
-
-    update.message.reply_text(
-        "🔥 Select driver to fire:",
-        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True)
-    )
-    return FIRE_USER
-
-def fire_user(update, context):
-    admin_id = update.effective_user.id
-    selected = update.message.text.strip()
-    
-    logger.info(f"Admin {admin_id} selected to fire: {selected}")
-
-    if admin_id not in fire_state or selected not in fire_state[admin_id]:
-        update.message.reply_text("❌ Invalid selection.")
-        return ConversationHandler.END
-
-    uid = fire_state[admin_id][selected]
-    context.user_data["fire_uid"] = uid
-    
-    try:
-        chat = bot.get_chat(uid)
-        name = f"@{chat.username}" if chat.username else chat.first_name
-    except:
-        name = selected
-        
-    # 双重确认
-    keyboard = [["🔥 Yes, fire this driver", "❌ Cancel"]]
-    update.message.reply_text(
-        f"⚠️ Are you sure you want to fire {name}? This action is irreversible!",
-        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True)
-    )
-    return FIRE_CONFIRM
-
-def fire_confirm(update, context):
-    admin_id = update.effective_user.id
-    confirmation = update.message.text.strip()
-    
-    if confirmation != "🔥 Yes, fire this driver":
-        update.message.reply_text("❌ Fire operation cancelled.")
-        return ConversationHandler.END
-        
-    uid = context.user_data.get("fire_uid")
-    if not uid:
-        update.message.reply_text("❌ Error: No user selected.")
-        return ConversationHandler.END
-    
-    # 添加到解雇名单
-    fired_drivers.add(uid)
-    
-    try:
-        chat = bot.get_chat(uid)
-        name = f"@{chat.username}" if chat.username else chat.first_name
-        
-        # 通知管理员
-        update.message.reply_text(f"🔥 {name} has been fired. Access revoked.")
-        logger.info(f"Admin {admin_id} fired user {name} (ID: {uid})")
-        
-        # 通知被解雇的司机
-        try:
-            bot.send_message(
-                uid,
-                "🚫 You have been fired and no longer have access to the Driver ClockIn Bot."
-            )
-        except Exception as e:
-            logger.error(f"Failed to notify fired user {uid}: {str(e)}")
-    except Exception as e:
-        logger.error(f"Error getting chat for fired user {uid}: {str(e)}")
-        update.message.reply_text(f"🔥 User {uid} has been fired. Access revoked.")
-    
-    return ConversationHandler.END
-
 def cancel(update, context):
     user_id = update.effective_user.id
     username = update.effective_user.username or str(user_id)
@@ -632,12 +401,6 @@ def cancel(update, context):
         del claim_state[user_id]
     if user_id in topup_state:
         del topup_state[user_id]
-    if user_id in fire_state:
-        del fire_state[user_id]
-    
-    # 清理上下文数据
-    context.user_data.pop("topup_uid", None)
-    context.user_data.pop("fire_uid", None)
     
     logger.info(f"User {username} cancelled operation")
     
@@ -652,7 +415,6 @@ def webhook():
 
 # === Dispatcher 注册 ===
 dispatcher.add_handler(CommandHandler("start", start))
-dispatcher.add_handler(CommandHandler("help", help_command))
 dispatcher.add_handler(CommandHandler("clockin", clockin))
 dispatcher.add_handler(CommandHandler("clockout", clockout))
 dispatcher.add_handler(CommandHandler("offday", offday))
@@ -681,40 +443,10 @@ dispatcher.add_handler(ConversationHandler(
     fallbacks=[CommandHandler("cancel", cancel)],
 ))
 
-# === fire handler ===
-dispatcher.add_handler(ConversationHandler(
-    entry_points=[CommandHandler("fire", fire_start)],
-    states={
-        FIRE_USER: [MessageHandler(Filters.text & ~Filters.command, fire_user)],
-        FIRE_CONFIRM: [MessageHandler(Filters.text & ~Filters.command, fire_confirm)],
-    },
-    fallbacks=[CommandHandler("cancel", cancel)],
-))
-
 # === 注册错误处理器 ===
 dispatcher.add_error_handler(error_handler)
-
-# === 初始命令设置 ===
-def set_default_commands():
-    """设置默认命令（普通用户命令）"""
-    default_commands = [
-        BotCommand("clockin", "Clock in to start work"),
-        BotCommand("clockout", "Clock out to end work"),
-        BotCommand("offday", "Mark today as off day"),
-        BotCommand("claim", "Submit a claim for travel fund"),
-        BotCommand("help", "Show help information")
-    ]
-    
-    try:
-        bot.set_my_commands(default_commands)
-        logger.info("Default bot commands set successfully.")
-    except telegram.error.BadRequest as e:
-        logger.error(f"Bad request when setting default commands: {str(e)}")
-    except Exception as e:
-        logger.error(f"Error setting default commands: {str(e)}")
 
 # === Run ===
 if __name__ == "__main__":
     logger.info("Bot server started.")
-    set_default_commands()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
