@@ -5,7 +5,7 @@ from telegram.ext import Dispatcher, CommandHandler
 import datetime
 
 # 替换成你从 BotFather 获得的 Bot Token
-TOKEN = 8048874124:AAEui2d17usur6oSQmsjjdN0IiSmngjO4mA
+TOKEN = "8048874124:AAEui2d17usur6oSQmsjjdN0IiSmngjO4mA"
 
 # 创建 Flask 应用
 app = Flask(__name__)
