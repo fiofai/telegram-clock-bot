@@ -76,45 +76,66 @@ def clockout(update, context):
     today = now.strftime("%Y-%m-%d")
     clock_time = now.strftime("%Y-%m-%d %H:%M:%S")
 
-    # 检查是否已打卡
     if today not in driver_logs.get(user_id, {}) or 'in' not in driver_logs[user_id][today]:
         update.message.reply_text("❌ You haven't clocked in today.")
         return
 
     try:
         driver_logs[user_id][today]['out'] = clock_time
-
-        # 修复点：解析时添加时区（与 now 保持一致）
-        in_time_str = driver_logs[user_id][today]['in']
-        in_time = datetime.datetime.strptime(in_time_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=tz)  # 添加时区
         
-        duration = now - in_time  # 现在类型一致，可安全计算
+        # 更安全的时区本地化方法
+        in_time_str = driver_logs[user_id][today]['in']
+        naive_in_time = datetime.datetime.strptime(in_time_str, "%Y-%m-%d %H:%M:%S")
+        
+        # 根据时区库类型选择正确的本地化方式
+        if hasattr(tz, 'localize'):
+            # 适用于 pytz 时区
+            in_time = tz.localize(naive_in_time)
+        else:
+            # 适用于 Python 3.9+ 的 zoneinfo
+            in_time = naive_in_time.replace(tzinfo=tz)
+        
+        # 添加调试日志
+        logger.debug(f"User {user_id} - in_time: {in_time}, now: {now}")
+        
+        # 直接计算时间差
+        duration = now - in_time
         total_seconds = duration.total_seconds()
+        
+        # 确保时间差为正数
+        if total_seconds < 0:
+            logger.warning(f"Negative time difference detected: {total_seconds} seconds")
+            total_seconds = abs(total_seconds)
+        
         hours = int(total_seconds // 3600)
         minutes = int((total_seconds % 3600) // 60)
+        seconds = int(total_seconds % 60)
 
-        # 时间格式化（保持不变）
-        if hours and minutes:
-            time_str = f"{hours}hour{'s' if hours > 1 else ''} and {minutes}min"
-        elif hours:
-            time_str = f"{hours}hour{'s' if hours > 1 else ''}"
-        else:
-            time_str = f"{minutes}min"
-
-        # 确保 driver_salaries 结构存在
+        # 格式化时间显示
+        time_parts = []
+        if hours > 0:
+            time_parts.append(f"{hours} hour{'s' if hours > 1 else ''}")
+        if minutes > 0:
+            time_parts.append(f"{minutes} min")
+        if seconds > 0 or (hours == 0 and minutes == 0):
+            time_parts.append(f"{seconds} sec")
+        
+        time_str = " ".join(time_parts)
+        
+        # 初始化薪资记录
         if user_id not in driver_salaries:
             driver_salaries[user_id] = {'total_hours': 0.0, 'daily_log': {}}
         
-        # 累计工时
-        driver_salaries[user_id]['total_hours'] += total_seconds / 3600
-        driver_salaries[user_id]['daily_log'][today] = total_seconds / 3600
+        # 累计工时（以小时为单位）
+        hours_worked = total_seconds / 3600
+        driver_salaries[user_id]['total_hours'] += hours_worked
+        driver_salaries[user_id]['daily_log'][today] = hours_worked
 
         update.message.reply_text(f"🏁 Clocked out at {clock_time}. Worked {time_str}.")
     
     except Exception as e:
-        # 异常处理：打印日志并通知用户
-        logger.error(f"Clockout error: {str(e)}")
-        update.message.reply_text(f"⚠️ Error during clockout: {str(e)}")
+        logger.error(f"Clockout error: {str(e)}", exc_info=True)
+        update.message.reply_text("⚠️ Error processing clockout. Please try again.")
 
 # === /offday ===
 def offday(update, context):
