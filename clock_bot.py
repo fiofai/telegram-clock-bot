@@ -74,7 +74,8 @@ def clockout(update, context):
     user_id = update.effective_user.id
     now = datetime.datetime.now(tz)
     today = now.strftime("%Y-%m-%d")
-    clock_time = now.strftime("%Y-%m-%d %H:%M:%S")
+    clock_time = now.strftime("%Y-%m-%d %H:%M:%S")# 在 clockout 函数开头加入 debug
+    print("✅ Running /clockout")  # 在Render后台可看到
 
     if today not in driver_logs.get(user_id, {}) or 'in' not in driver_logs[user_id][today]:
         update.message.reply_text("❌ You haven't clocked in today.")
