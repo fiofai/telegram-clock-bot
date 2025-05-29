@@ -98,8 +98,10 @@ def balance(update, context):
     if update.effective_user.id not in ADMIN_IDS:
         return update.message.reply_text("❌ You are not authorized.")
     msg = "📊 Driver Balances:\n"
-    for uid, acc in driver_accounts.items():
-        msg += f"• ID {uid}: RM{acc['balance']:.2f}\n"
+for uid, acc in driver_accounts.items():
+    user_obj = bot.get_chat(uid)
+    name = f"@{user_obj.username}" if user_obj.username else user_obj.first_name
+    msg += f"• {name}: RM{acc['balance']:.2f}\n"
     update.message.reply_text(msg)
 
 # /check
@@ -112,7 +114,12 @@ def check(update, context):
         today = log.get(date, {})
         in_time = today.get("in", "❌")
         out_time = today.get("out", "❌")
-        msg += f"• ID {uid}: IN: {in_time}, OUT: {out_time}\n"
+
+         # 获取用户名或昵称（优先 username）
+    user_obj = bot.get_chat(uid)
+    name = f"@{user_obj.username}" if user_obj.username else user_obj.first_name
+    
+    msg += f"• {name}: IN: {in_time}, OUT: {out_time}\n"
     update.message.reply_text(msg)
 
 # /claim 引导
