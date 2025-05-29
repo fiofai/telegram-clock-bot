@@ -74,33 +74,47 @@ def clockout(update, context):
     user_id = update.effective_user.id
     now = datetime.datetime.now(tz)
     today = now.strftime("%Y-%m-%d")
-    clock_time = now.strftime("%Y-%m-%d %H:%M:%S")# 在 clockout 函数开头加入 debug
-    print("✅ Running /clockout")  # 在Render后台可看到
+    clock_time = now.strftime("%Y-%m-%d %H:%M:%S")
 
+    # 检查是否已打卡
     if today not in driver_logs.get(user_id, {}) or 'in' not in driver_logs[user_id][today]:
         update.message.reply_text("❌ You haven't clocked in today.")
         return
 
-    driver_logs[user_id][today]['out'] = clock_time
+    try:
+        driver_logs[user_id][today]['out'] = clock_time
 
-    in_time = datetime.datetime.strptime(driver_logs[user_id][today]['in'], "%Y-%m-%d %H:%M:%S")
-    duration = now - in_time
-    total_seconds = duration.total_seconds()
-    hours = int(total_seconds // 3600)
-    minutes = int((total_seconds % 3600) // 60)
+        # 修复点：解析时添加时区（与 now 保持一致）
+        in_time_str = driver_logs[user_id][today]['in']
+        in_time = datetime.datetime.strptime(in_time_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=tz)  # 添加时区
+        
+        duration = now - in_time  # 现在类型一致，可安全计算
+        total_seconds = duration.total_seconds()
+        hours = int(total_seconds // 3600)
+        minutes = int((total_seconds % 3600) // 60)
 
-    if hours and minutes:
-        time_str = f"{hours}hour{'s' if hours > 1 else ''} and {minutes}min"
-    elif hours:
-        time_str = f"{hours}hour{'s' if hours > 1 else ''}"
-    else:
-        time_str = f"{minutes}min"
+        # 时间格式化（保持不变）
+        if hours and minutes:
+            time_str = f"{hours}hour{'s' if hours > 1 else ''} and {minutes}min"
+        elif hours:
+            time_str = f"{hours}hour{'s' if hours > 1 else ''}"
+        else:
+            time_str = f"{minutes}min"
 
-    # 累计工时
-    driver_salaries[user_id]['total_hours'] += total_seconds / 3600
-    driver_salaries[user_id]['daily_log'][today] = total_seconds / 3600
+        # 确保 driver_salaries 结构存在
+        if user_id not in driver_salaries:
+            driver_salaries[user_id] = {'total_hours': 0.0, 'daily_log': {}}
+        
+        # 累计工时
+        driver_salaries[user_id]['total_hours'] += total_seconds / 3600
+        driver_salaries[user_id]['daily_log'][today] = total_seconds / 3600
 
-    update.message.reply_text(f"🏁 Clocked out at {clock_time}. Worked {time_str}.")
+        update.message.reply_text(f"🏁 Clocked out at {clock_time}. Worked {time_str}.")
+    
+    except Exception as e:
+        # 异常处理：打印日志并通知用户
+        logger.error(f"Clockout error: {str(e)}")
+        update.message.reply_text(f"⚠️ Error during clockout: {str(e)}")
 
 # === /offday ===
 def offday(update, context):
