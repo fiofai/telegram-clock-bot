@@ -95,7 +95,7 @@ def clockout(update, context):
     else:
         time_str = f"{minutes}min"
 
-    # 累计时数
+    # 累计工时
     driver_salaries[user_id]['total_hours'] += total_seconds / 3600
     driver_salaries[user_id]['daily_log'][today] = total_seconds / 3600
 
