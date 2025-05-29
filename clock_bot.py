@@ -3,36 +3,43 @@
 from flask import Flask, request
 from telegram import Bot, Update, ReplyKeyboardMarkup
 from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters, ConversationHandler
-import os
 import datetime
+import pytz
+import os
 
 app = Flask(__name__)
-TOKEN = os.environ['TOKEN']
+
+# === 配置 ===
+TOKEN = os.environ.get("TOKEN")
+ADMIN_IDS = [1165249082]  # 管理员 Telegram 用户 ID，可添加多个
+
+# 初始化 bot
 bot = Bot(token=TOKEN)
 dispatcher = Dispatcher(bot, None, use_context=True)
 
-# 支持多个管理员 ID
-ADMIN_IDS = [1165249082]
-
-# 所有司机的打卡/余额/报销记录
+# === 全局数据结构 ===
 driver_logs = {}
 driver_salaries = {}
 driver_accounts = {}
 
-# 报销流程状态码
-CLAIM_TYPE, CLAIM_OTHER, CLAIM_AMOUNT, CLAIM_PROOF = range(4)
+# === /claim 用于状态追踪 ===
+CLAIM_TYPE, CLAIM_AMOUNT, CLAIM_PROOF, CLAIM_OTHER_TYPE = range(4)
+claim_state = {}  # 存储正在报销的司机状态
 
-# /start
+# === 时区设置：马来西亚时间 ===
+tz = pytz.timezone("Asia/Kuala_Lumpur")
+
+# === /start 命令 ===
 def start(update, context):
-    user_id = update.effective_user.id
-    name = update.effective_user.first_name
+    user = update.effective_user
+    user_id = user.id
 
     driver_logs.setdefault(user_id, {})
     driver_salaries.setdefault(user_id, {"total_hours": 0.0, "daily_log": {}})
     driver_accounts.setdefault(user_id, {"balance": 0.0, "claims": []})
 
     msg = (
-        f"👋 Hello {name}!\n"
+        f"👋 Hello {user.first_name}!\n"
         "Welcome to Driver ClockIn Bot.\n\n"
         "Available Commands:\n"
         "🕑 /clockin - Start work\n"
@@ -52,100 +59,124 @@ def start(update, context):
 
     update.message.reply_text(msg)
 
-# /clockin
+# === /clockin ===
 def clockin(update, context):
     user_id = update.effective_user.id
-    now = datetime.datetime.now()
-    date = now.strftime("%Y-%m-%d")
-    driver_logs.setdefault(user_id, {}).setdefault(date, {})["in"] = now.strftime("%Y-%m-%d %H:%M:%S")
-    update.message.reply_text(f"✅ Clocked in at {now.strftime('%H:%M:%S')}")
+    now = datetime.datetime.now(tz)
+    today = now.strftime("%Y-%m-%d")
+    clock_time = now.strftime("%Y-%m-%d %H:%M:%S")
 
-# /clockout
+    driver_logs.setdefault(user_id, {}).setdefault(today, {})['in'] = clock_time
+    update.message.reply_text(f"✅ Clocked in at {clock_time}")
+
+# === /clockout ===
 def clockout(update, context):
     user_id = update.effective_user.id
-    now = datetime.datetime.now()
-    date = now.strftime("%Y-%m-%d")
-    log = driver_logs.setdefault(user_id, {}).setdefault(date, {})
-    log["out"] = now.strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.datetime.now(tz)
+    today = now.strftime("%Y-%m-%d")
+    clock_time = now.strftime("%Y-%m-%d %H:%M:%S")
 
-    if "in" in log:
-        time_in = datetime.datetime.strptime(log["in"], "%Y-%m-%d %H:%M:%S")
-        worked = (now - time_in).total_seconds() / 3600.0
-        salary = driver_salaries[user_id]
-        salary["total_hours"] += worked
-        salary["daily_log"][date] = worked
-        update.message.reply_text(f"🏁 Clocked out at {now.strftime('%H:%M:%S')}. Worked {worked:.2f} hours.")
+    if today not in driver_logs.get(user_id, {}) or 'in' not in driver_logs[user_id][today]:
+        update.message.reply_text("❌ You haven't clocked in today.")
+        return
+
+    driver_logs[user_id][today]['out'] = clock_time
+
+    in_time = datetime.datetime.strptime(driver_logs[user_id][today]['in'], "%Y-%m-%d %H:%M:%S")
+    duration = now - in_time
+    total_seconds = duration.total_seconds()
+    hours = int(total_seconds // 3600)
+    minutes = int((total_seconds % 3600) // 60)
+
+    if hours and minutes:
+        time_str = f"{hours}hour{'s' if hours > 1 else ''} and {minutes}min"
+    elif hours:
+        time_str = f"{hours}hour{'s' if hours > 1 else ''}"
     else:
-        update.message.reply_text("⚠️ You didn't clock in today.")
+        time_str = f"{minutes}min"
 
-# /topup
-def topup(update, context):
-    if update.effective_user.id not in ADMIN_IDS:
-        return update.message.reply_text("❌ You are not authorized.")
-    if len(context.args) != 2:
-        return update.message.reply_text("Usage: /topup <user_id> <amount>")
-    try:
-        target = int(context.args[0])
-        amount = float(context.args[1])
-        driver_accounts.setdefault(target, {"balance": 0.0, "claims": []})
-        driver_accounts[target]["balance"] += amount
-        update.message.reply_text(f"✅ Topped up RM{amount:.2f} to user {target}")
-    except:
-        update.message.reply_text("❌ Invalid input.")
+    # 累计时数
+    driver_salaries[user_id]['total_hours'] += total_seconds / 3600
+    driver_salaries[user_id]['daily_log'][today] = total_seconds / 3600
 
-# /balance
+    update.message.reply_text(f"🏁 Clocked out at {clock_time}. Worked {time_str}.")
+
+# === /offday ===
+def offday(update, context):
+    user_id = update.effective_user.id
+    today = datetime.datetime.now(tz).strftime("%Y-%m-%d")
+    driver_logs.setdefault(user_id, {})[today] = {"in": "OFF", "out": "OFF"}
+    update.message.reply_text(f"📅 Marked {today} as off day.")
+
+# === /balance（仅管理员）===
 def balance(update, context):
     if update.effective_user.id not in ADMIN_IDS:
-        return update.message.reply_text("❌ You are not authorized.")
+        return
     msg = "📊 Driver Balances:\n"
-for uid, acc in driver_accounts.items():
-    user_obj = bot.get_chat(uid)
-    name = f"@{user_obj.username}" if user_obj.username else user_obj.first_name
-    msg += f"• {name}: RM{acc['balance']:.2f}\n"
+    for uid, acc in driver_accounts.items():
+        chat = bot.get_chat(uid)
+        name = f"@{chat.username}" if chat.username else chat.first_name
+        msg += f"• {name}: RM{acc['balance']:.2f}\n"
     update.message.reply_text(msg)
 
-# /check
+# === /check（仅管理员）===
 def check(update, context):
     if update.effective_user.id not in ADMIN_IDS:
-        return update.message.reply_text("❌ You are not authorized.")
-    date = datetime.datetime.now().strftime("%Y-%m-%d")
+        return
+    today = datetime.datetime.now(tz).strftime("%Y-%m-%d")
     msg = "📄 Today's Status:\n"
     for uid, log in driver_logs.items():
-        today = log.get(date, {})
-        in_time = today.get("in", "❌")
-        out_time = today.get("out", "❌")
-
-         # 获取用户名或昵称（优先 username）
-    user_obj = bot.get_chat(uid)
-    name = f"@{user_obj.username}" if user_obj.username else user_obj.first_name
-    
-    msg += f"• {name}: IN: {in_time}, OUT: {out_time}\n"
+        day = log.get(today, {})
+        in_time = day.get("in", "❌")
+        out_time = day.get("out", "❌")
+        chat = bot.get_chat(uid)
+        name = f"@{chat.username}" if chat.username else chat.first_name
+        msg += f"• {name}: IN: {in_time}, OUT: {out_time}\n"
     update.message.reply_text(msg)
 
-# /claim 引导
+# === /topup（仅管理员）===
+def topup(update, context):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    try:
+        uid = int(context.args[0])
+        amount = float(context.args[1])
+        driver_accounts.setdefault(uid, {"balance": 0.0, "claims": []})["balance"] += amount
+        update.message.reply_text(f"✅ Added RM{amount:.2f} to user {uid}.")
+    except:
+        update.message.reply_text("❌ Usage: /topup <user_id> <amount>")
+
+# === /claim 分阶段 ===
 def claim_start(update, context):
-    reply = ReplyKeyboardMarkup([["toll", "petrol", "other"]], one_time_keyboard=True, resize_keyboard=True)
-    update.message.reply_text("💬 Select claim type:", reply_markup=reply)
+    reply_keyboard = [["toll", "petrol", "other"]]
+    update.message.reply_text(
+        "🚗 Select claim type:",
+        reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True)
+    )
     return CLAIM_TYPE
 
 def claim_type(update, context):
-    if update.message.text == "other":
-        update.message.reply_text("🔤 Enter type:")
-        return CLAIM_OTHER
-    context.user_data["type"] = update.message.text
-    update.message.reply_text("💰 Enter amount:")
+    user_id = update.effective_user.id
+    text = update.message.text.lower()
+    claim_state[user_id] = {"type": text}
+    if text == "other":
+        update.message.reply_text("✍️ Please enter the type description:")
+        return CLAIM_OTHER_TYPE
+    update.message.reply_text("💰 Enter amount (number):")
     return CLAIM_AMOUNT
 
-def claim_other(update, context):
-    context.user_data["type"] = update.message.text
-    update.message.reply_text("💰 Enter amount:")
+def claim_other_type(update, context):
+    user_id = update.effective_user.id
+    claim_state[user_id]["type"] = update.message.text
+    update.message.reply_text("💰 Enter amount (number):")
     return CLAIM_AMOUNT
 
 def claim_amount(update, context):
+    user_id = update.effective_user.id
     try:
-        amt = float(update.message.text)
-        context.user_data["amount"] = amt
-        update.message.reply_text("📎 Please upload a photo (receipt/proof):")
+        amount = float(update.message.text)
+        claim_state[user_id]["amount"] = amount
+        update.message.reply_text("📎 Now send the proof photo:")
         return CLAIM_PROOF
     except:
         update.message.reply_text("❌ Please enter a valid number.")
@@ -153,44 +184,51 @@ def claim_amount(update, context):
 
 def claim_proof(update, context):
     user_id = update.effective_user.id
-    claim = {
-        "type": context.user_data["type"],
-        "amount": context.user_data["amount"],
-        "proof": update.message.photo[-1].file_id,
-        "date": datetime.datetime.now().strftime("%Y-%m-%d")
+    file_id = update.message.photo[-1].file_id
+    date = datetime.datetime.now(tz).strftime("%Y-%m-%d")
+
+    entry = {
+        "amount": claim_state[user_id]["amount"],
+        "type": claim_state[user_id]["type"],
+        "date": date,
+        "photo": file_id
     }
-    driver_accounts[user_id]["claims"].append(claim)
-    driver_accounts[user_id]["balance"] -= claim["amount"]
-    update.message.reply_text("✅ Claim recorded.")
+
+    driver_accounts.setdefault(user_id, {"balance": 0.0, "claims": []})
+    driver_accounts[user_id]["claims"].append(entry)
+    driver_accounts[user_id]["balance"] -= entry["amount"]
+
+    update.message.reply_text(f"✅ RM{entry['amount']} claimed for {entry['type']} on {entry['date']}.")
     return ConversationHandler.END
 
 def cancel(update, context):
     update.message.reply_text("❌ Claim cancelled.")
     return ConversationHandler.END
 
-# 注册指令
-dispatcher.add_handler(CommandHandler("start", start))
-dispatcher.add_handler(CommandHandler("clockin", clockin))
-dispatcher.add_handler(CommandHandler("clockout", clockout))
-dispatcher.add_handler(CommandHandler("topup", topup))
-dispatcher.add_handler(CommandHandler("balance", balance))
-dispatcher.add_handler(CommandHandler("check", check))
-
-conv_handler = ConversationHandler(
-    entry_points=[CommandHandler("claim", claim_start)],
-    states={
-        CLAIM_TYPE: [MessageHandler(Filters.text & ~Filters.command, claim_type)],
-        CLAIM_OTHER: [MessageHandler(Filters.text & ~Filters.command, claim_other)],
-        CLAIM_AMOUNT: [MessageHandler(Filters.text & ~Filters.command, claim_amount)],
-        CLAIM_PROOF: [MessageHandler(Filters.photo, claim_proof)],
-    },
-    fallbacks=[CommandHandler("cancel", cancel)]
-)
-dispatcher.add_handler(conv_handler)
-
+# === Webhook入口 ===
 @app.route(f"/{TOKEN}", methods=["POST"])
 def webhook():
     update = Update.de_json(request.get_json(force=True), bot)
     dispatcher.process_update(update)
-    return "OK"
+    return "ok"
+
+# === 注册指令 ===
+dispatcher.add_handler(CommandHandler("start", start))
+dispatcher.add_handler(CommandHandler("clockin", clockin))
+dispatcher.add_handler(CommandHandler("clockout", clockout))
+dispatcher.add_handler(CommandHandler("offday", offday))
+dispatcher.add_handler(CommandHandler("balance", balance))
+dispatcher.add_handler(CommandHandler("check", check))
+dispatcher.add_handler(CommandHandler("topup", topup))
+
+dispatcher.add_handler(ConversationHandler(
+    entry_points=[CommandHandler("claim", claim_start)],
+    states={
+        CLAIM_TYPE: [MessageHandler(Filters.text & ~Filters.command, claim_type)],
+        CLAIM_OTHER_TYPE: [MessageHandler(Filters.text & ~Filters.command, claim_other_type)],
+        CLAIM_AMOUNT: [MessageHandler(Filters.text & ~Filters.command, claim_amount)],
+        CLAIM_PROOF: [MessageHandler(Filters.photo, claim_proof)],
+    },
+    fallbacks=[CommandHandler("cancel", cancel)],
+))
 
