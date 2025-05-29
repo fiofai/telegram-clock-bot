@@ -221,6 +221,42 @@ def check(update, context):
         msg += f"• {name}: IN: {in_time}, OUT: {out_time}\n"
     update.message.reply_text(msg)
 
+# === /viewclaims（仅管理员）===
+def viewclaims(update, context):
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        update.message.reply_text("❌ You are not authorized to use this command.")
+        return
+
+    any_claims = False
+    for uid, acc in driver_accounts.items():
+        claims = acc.get("claims", [])
+        if not claims:
+            continue
+
+        any_claims = True
+        try:
+            chat = bot.get_chat(uid)
+            username = f"@{chat.username}" if chat.username else chat.first_name
+        except:
+            username = str(uid)
+
+        for entry in claims:
+            date = entry.get("date", "N/A")
+            ctype = entry.get("type", "N/A")
+            amount = entry.get("amount", 0)
+            photo_id = entry.get("photo", None)
+
+            caption = f"🧾 Claim from {username}\nDate: {date}\nType: {ctype}\nAmount: RM{amount:.2f}"
+            if photo_id:
+                bot.send_photo(chat_id=update.effective_chat.id, photo=photo_id, caption=caption)
+            else:
+                update.message.reply_text(caption)
+
+    if not any_claims:
+        update.message.reply_text("✅ No claims have been submitted yet.")
+
+
 # === /topup (交互流程管理员专用) ===
 def topup_start(update, context):
     user_id = update.effective_user.id
@@ -422,6 +458,7 @@ dispatcher.add_handler(CommandHandler("balance", balance))
 dispatcher.add_handler(CommandHandler("check", check))
 
 # === topup handler ===
+dispatcher.add_handler(CommandHandler("viewclaims", viewclaims))
 dispatcher.add_handler(ConversationHandler(
     entry_points=[CommandHandler("topup", topup_start)],
     states={
