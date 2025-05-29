@@ -83,7 +83,7 @@ def start(update, context):
             "📊 /balance\n"
             "📄 /check\n"
             "🧾 /PDF\n"
-            "💵 /topup"
+            "💵 /topup\n"
             "📷 /viewclaims - View submitted claims"
         )
 
