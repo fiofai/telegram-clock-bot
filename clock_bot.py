@@ -228,22 +228,51 @@ def viewclaims(update, context):
     if user_id not in ADMIN_IDS:
         return update.message.reply_text("❌ You are not an admin.")
     
-    msg = "📷 Claim Summary:\n"
+    logger.info(f"Admin {user_id} requested viewclaims with photos")
+    
+    # 首先发送总结信息
+    update.message.reply_text("📷 Claim Summary - 正在加载照片...")
+    
+    # 遍历所有司机的索赔记录
     for uid, account in driver_accounts.items():
         claims = account.get("claims", [])
         if not claims:
             continue
+            
         try:
             chat = bot.get_chat(uid)
             name = f"@{chat.username}" if chat.username else chat.first_name
         except:
             name = str(uid)
         
-        msg += f"\n🧾 {name}'s Claims:\n"
-        for c in claims[-5:]:  # 显示最多 5 条
-            msg += f"• {c['date']} - RM{c['amount']} ({c['type']})\n"
+        # 发送司机名称
+        update.message.reply_text(f"\n🧾 {name}'s Claims:")
+        
+        # 显示最近的5条记录（带照片）
+        for c in claims[-5:]:
+            # 准备说明文字
+            caption = f"📅 日期: {c['date']}\n💰 金额: RM{c['amount']}\n🏷️ 类型: {c['type']}"
+            
+            # 检查是否有照片ID
+            if 'photo' in c and c['photo']:
+                try:
+                    # 发送照片和说明
+                    bot.send_photo(
+                        chat_id=update.effective_chat.id,
+                        photo=c['photo'],
+                        caption=caption
+                    )
+                    logger.info(f"Sent claim photo for {name}, date: {c['date']}")
+                except Exception as e:
+                    # 如果照片发送失败，发送错误信息和文字说明
+                    logger.error(f"Error sending photo: {str(e)}")
+                    update.message.reply_text(f"❌ 照片加载失败: {c['date']} - RM{c['amount']} ({c['type']})")
+            else:
+                # 如果没有照片，只发送文字说明
+                update.message.reply_text(f"📝 {c['date']} - RM{c['amount']} ({c['type']}) - 无照片")
 
-    update.message.reply_text(msg)
+    # 发送完成提示
+    update.message.reply_text("✅ 所有索赔记录已加载完成。")
 
 # === /topup (交互流程管理员专用) ===
 def topup_start(update, context):
