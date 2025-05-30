@@ -47,7 +47,10 @@ app = Flask(__name__)
 
 TOKEN = os.environ.get("TOKEN")
 ADMIN_IDS = [1165249082]
-HOURLY_RATE = 20.00  # 默认时薪，RM20/小时
+DEFAULT_HOURLY_RATE = 20.00  # 默认时薪，RM20/小时
+DEFAULT_MONTHLY_SALARY = 3500.00  # 默认月薪，RM3500
+WORKING_DAYS_PER_MONTH = 22  # 默认每月工作天数
+WORKING_HOURS_PER_DAY = 8  # 默认每天工作小时数
 
 bot = Bot(token=TOKEN)
 dispatcher = Dispatcher(bot, None, use_context=True)
@@ -65,14 +68,16 @@ driver_salaries = {}
 driver_accounts = {}
 topup_state = {}
 claim_state = {}
-pdf_state = {}  # 新增：用于存储PDF生成状态
+pdf_state = {}  # 用于存储PDF生成状态
+salary_state = {}  # 新增：用于存储薪资设置状态
 
 tz = pytz.timezone("Asia/Kuala_Lumpur")
 
 # === conversation 状态 ===
 TOPUP_USER, TOPUP_AMOUNT = range(2)
 CLAIM_TYPE, CLAIM_OTHER_TYPE, CLAIM_AMOUNT, CLAIM_PROOF = range(4)
-PDF_SELECT_DRIVER = range(1)  # 新增：PDF司机选择状态
+PDF_SELECT_DRIVER = range(1)  # PDF司机选择状态
+SALARY_SELECT_DRIVER, SALARY_ENTER_AMOUNT = range(2)  # 新增：薪资设置状态
 
 # === 辅助函数 ===
 def format_local_time(timestamp_str):
@@ -119,12 +124,26 @@ def get_month_date_range(date=None):
 
 def get_topup_history(user_id):
     """获取用户的充值历史记录"""
-    # 这里需要修改数据结构以支持充值历史记录
-    # 为简化实现，我们假设充值记录已经存储在driver_accounts中
     if user_id not in driver_accounts:
         return []
     
     return driver_accounts[user_id].get("topup_history", [])
+
+def calculate_hourly_rate(monthly_salary):
+    """根据月薪计算时薪"""
+    try:
+        monthly_salary = float(monthly_salary)
+        hourly_rate = monthly_salary / (WORKING_DAYS_PER_MONTH * WORKING_HOURS_PER_DAY)
+        return round(hourly_rate, 2)
+    except:
+        return DEFAULT_HOURLY_RATE
+
+def get_driver_hourly_rate(driver_id):
+    """获取司机的时薪"""
+    if driver_id in driver_salaries and "monthly_salary" in driver_salaries[driver_id]:
+        monthly_salary = driver_salaries[driver_id]["monthly_salary"]
+        return calculate_hourly_rate(monthly_salary)
+    return DEFAULT_HOURLY_RATE
 
 # === PDF 生成功能 ===
 def download_telegram_photo(file_id, bot):
@@ -308,9 +327,17 @@ def generate_driver_pdf(driver_id, driver_name, driver_logs, driver_salaries, dr
     elements.append(Paragraph(period_text, custom_normal_style))
     elements.append(Spacer(1, 6))
     
+    # 获取司机个性化时薪
+    hourly_rate = get_driver_hourly_rate(driver_id)
+    
+    # 获取月薪（如果有设置）
+    monthly_salary = "N/A"
+    if driver_id in driver_salaries and "monthly_salary" in driver_salaries[driver_id]:
+        monthly_salary = f"RM{driver_salaries[driver_id]['monthly_salary']:.2f}"
+    
     # 工资计算
-    gross_pay = total_hours * HOURLY_RATE
-    pay_text = f"Hourly Rate: RM{HOURLY_RATE:.2f}\nTotal Hours: {format_duration(total_hours)}\nGross Pay: RM{gross_pay:.2f}"
+    gross_pay = total_hours * hourly_rate
+    pay_text = f"Monthly Salary: {monthly_salary}\nHourly Rate: RM{hourly_rate:.2f}\nTotal Hours: {format_duration(total_hours)}\nGross Pay: RM{gross_pay:.2f}"
     elements.append(Paragraph(pay_text, custom_normal_style))
     elements.append(Spacer(1, 12))
     
@@ -502,7 +529,8 @@ def start(update, context):
             "📄 /check\n"
             "🧾 /PDF\n"
             "💵 /topup\n"
-            "📷 /viewclaims"
+            "📷 /viewclaims\n"
+            "💰 /salary"  # 新增薪资设置命令
         )
 
     update.message.reply_text(msg)
@@ -517,7 +545,11 @@ def clockin(update, context):
     clock_time = now.strftime("%Y-%m-%d %H:%M:%S")
 
     driver_logs.setdefault(user_id, {}).setdefault(today, {})['in'] = clock_time
-    update.message.reply_text(f"✅ Clocked in at {format_local_time(clock_time)}")
+    
+    # 修复：使用format_local_time确保显示本地时间格式
+    local_time = format_local_time(clock_time)
+    update.message.reply_text(f"✅ Clocked in at {local_time}")
+    
     logger.info(f"User {username} clocked in at {clock_time}")
 
 # === /clockout ===
@@ -578,7 +610,10 @@ def clockout(update, context):
         driver_salaries[user_id]['total_hours'] += hours_worked
         driver_salaries[user_id]['daily_log'][today] = hours_worked
 
-        update.message.reply_text(f"🏁 Clocked out at {format_local_time(clock_time)}. Worked {time_str}.")
+        # 修复：使用format_local_time确保显示本地时间格式
+        local_time = format_local_time(clock_time)
+        update.message.reply_text(f"🏁 Clocked out at {local_time}. Worked {time_str}.")
+        
         logger.info(f"User {username} clocked out: worked {time_str}")
     except Exception as e:
         # 记录错误日志
@@ -669,7 +704,107 @@ def viewclaims(update, context):
 
     update.message.reply_text(msg)
 
-# === /PDF (管理员) - 新版本，支持选择司机 ===
+# === /salary (管理员) - 新增薪资设置功能 ===
+def salary_start(update, context):
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        return update.message.reply_text("❌ You are not an admin.")
+    
+    logger.info(f"Admin {user_id} started salary setting process")
+    
+    keyboard = []
+    salary_state[user_id] = {}
+    
+    # 添加司机选项
+    for uid in driver_accounts.keys():
+        try:
+            chat = bot.get_chat(uid)
+            name = f"@{chat.username}" if chat.username else chat.first_name
+            keyboard.append([name])
+            salary_state[user_id][name] = uid
+        except Exception as e:
+            logger.error(f"Error getting chat for user {uid}: {str(e)}")
+            name = f"User {uid}"
+            keyboard.append([name])
+            salary_state[user_id][name] = uid
+
+    if not keyboard:
+        update.message.reply_text("❌ No drivers found.")
+        return ConversationHandler.END
+
+    update.message.reply_text(
+        "👤 Select driver to set salary:",
+        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True)
+    )
+    return SALARY_SELECT_DRIVER
+
+def salary_select_driver(update, context):
+    admin_id = update.effective_user.id
+    selected = update.message.text.strip()
+    
+    logger.info(f"Admin {admin_id} selected driver: {selected}")
+
+    if admin_id not in salary_state or selected not in salary_state[admin_id]:
+        update.message.reply_text("❌ Invalid selection.")
+        return ConversationHandler.END
+
+    driver_id = salary_state[admin_id][selected]
+    context.user_data["salary_driver_id"] = driver_id
+    context.user_data["salary_driver_name"] = selected
+    
+    # 获取当前薪资（如果有）
+    current_salary = "not set"
+    if driver_id in driver_salaries and "monthly_salary" in driver_salaries[driver_id]:
+        current_salary = f"RM{driver_salaries[driver_id]['monthly_salary']:.2f}"
+    
+    update.message.reply_text(
+        f"💰 Enter monthly salary for {selected}:\n"
+        f"Current salary: {current_salary}",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    return SALARY_ENTER_AMOUNT
+
+def salary_enter_amount(update, context):
+    admin_id = update.effective_user.id
+    try:
+        monthly_salary = float(update.message.text.strip())
+        driver_id = context.user_data.get("salary_driver_id")
+        driver_name = context.user_data.get("salary_driver_name")
+        
+        if not driver_id:
+            update.message.reply_text("❌ Error: No driver selected.")
+            return ConversationHandler.END
+            
+        # 确保司机薪资记录存在
+        driver_salaries.setdefault(driver_id, {
+            "total_hours": 0.0, 
+            "daily_log": {}
+        })
+        
+        # 设置月薪
+        driver_salaries[driver_id]["monthly_salary"] = monthly_salary
+        
+        # 计算时薪
+        hourly_rate = calculate_hourly_rate(monthly_salary)
+        
+        update.message.reply_text(
+            f"✅ Set monthly salary for {driver_name}:\n"
+            f"Monthly: RM{monthly_salary:.2f}\n"
+            f"Hourly: RM{hourly_rate:.2f}\n"
+            f"(Based on {WORKING_DAYS_PER_MONTH} days/month, {WORKING_HOURS_PER_DAY} hours/day)"
+        )
+        
+        logger.info(f"Admin {admin_id} set salary for {driver_name}: RM{monthly_salary:.2f}/month")
+    except ValueError:
+        update.message.reply_text("❌ Invalid amount. Please enter a number.")
+        return SALARY_ENTER_AMOUNT
+    except Exception as e:
+        logger.error(f"Salary setting error: {str(e)}")
+        update.message.reply_text("❌ An error occurred during salary setting.")
+    
+    return ConversationHandler.END
+
+# === /PDF (管理员) - 支持选择司机 ===
 def pdf_start(update, context):
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
@@ -996,6 +1131,8 @@ def cancel(update, context):
         del topup_state[user_id]
     if user_id in pdf_state:
         del pdf_state[user_id]
+    if user_id in salary_state:
+        del salary_state[user_id]
     
     logger.info(f"User {username} cancelled operation")
     
@@ -1018,6 +1155,16 @@ dispatcher.add_handler(CommandHandler("check", check))
 dispatcher.add_handler(CommandHandler("viewclaims", viewclaims))
 dispatcher.add_handler(CommandHandler("PDF", pdf_start))
 dispatcher.add_handler(CallbackQueryHandler(pdf_button_callback, pattern=r'^pdf_'))
+
+# === salary handler - 新增薪资设置处理器 ===
+dispatcher.add_handler(ConversationHandler(
+    entry_points=[CommandHandler("salary", salary_start)],
+    states={
+        SALARY_SELECT_DRIVER: [MessageHandler(Filters.text & ~Filters.command, salary_select_driver)],
+        SALARY_ENTER_AMOUNT: [MessageHandler(Filters.text & ~Filters.command, salary_enter_amount)],
+    },
+    fallbacks=[CommandHandler("cancel", cancel)],
+))
 
 # === topup handler ===
 dispatcher.add_handler(ConversationHandler(
