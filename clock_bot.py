@@ -1,9 +1,9 @@
 from flask import Flask, request
 from telegram import (
-    Bot, Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+    Bot, Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
 )
 from telegram.ext import (
-    Dispatcher, CommandHandler, MessageHandler, Filters, ConversationHandler
+    Dispatcher, CommandHandler, MessageHandler, Filters, ConversationHandler, CallbackQueryHandler
 )
 import datetime
 import pytz
@@ -12,6 +12,7 @@ import logging
 import traceback
 import tempfile
 import requests
+import calendar
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -46,6 +47,7 @@ app = Flask(__name__)
 
 TOKEN = os.environ.get("TOKEN")
 ADMIN_IDS = [1165249082]
+HOURLY_RATE = 20.00  # 默认时薪，RM20/小时
 
 bot = Bot(token=TOKEN)
 dispatcher = Dispatcher(bot, None, use_context=True)
@@ -63,12 +65,66 @@ driver_salaries = {}
 driver_accounts = {}
 topup_state = {}
 claim_state = {}
+pdf_state = {}  # 新增：用于存储PDF生成状态
 
 tz = pytz.timezone("Asia/Kuala_Lumpur")
 
 # === conversation 状态 ===
 TOPUP_USER, TOPUP_AMOUNT = range(2)
 CLAIM_TYPE, CLAIM_OTHER_TYPE, CLAIM_AMOUNT, CLAIM_PROOF = range(4)
+PDF_SELECT_DRIVER = range(1)  # 新增：PDF司机选择状态
+
+# === 辅助函数 ===
+def format_local_time(timestamp_str):
+    """将时间戳字符串转换为本地时间格式，去除国际时间部分"""
+    try:
+        # 解析时间字符串
+        dt = datetime.datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
+        # 只返回日期和时间部分，不包含时区
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except:
+        return timestamp_str  # 如果解析失败，返回原始字符串
+
+def format_duration(hours):
+    """将小时数转换为更友好的时长格式"""
+    try:
+        total_minutes = int(float(hours) * 60)
+        hours_part = total_minutes // 60
+        minutes_part = total_minutes % 60
+        
+        if hours_part > 0 and minutes_part > 0:
+            return f"{hours_part}Hour {minutes_part}Min"
+        elif hours_part > 0:
+            return f"{hours_part}Hour"
+        else:
+            return f"{minutes_part}Min"
+    except:
+        return str(hours)  # 如果转换失败，返回原始值
+
+def get_month_date_range(date=None):
+    """获取指定日期所在月份的起止日期"""
+    if date is None:
+        date = datetime.datetime.now(tz)
+    
+    year = date.year
+    month = date.month
+    
+    # 获取月份第一天和最后一天
+    first_day = datetime.date(year, month, 1)
+    
+    # 获取月份最后一天
+    last_day = datetime.date(year, month, calendar.monthrange(year, month)[1])
+    
+    return first_day, last_day
+
+def get_topup_history(user_id):
+    """获取用户的充值历史记录"""
+    # 这里需要修改数据结构以支持充值历史记录
+    # 为简化实现，我们假设充值记录已经存储在driver_accounts中
+    if user_id not in driver_accounts:
+        return []
+    
+    return driver_accounts[user_id].get("topup_history", [])
 
 # === PDF 生成功能 ===
 def download_telegram_photo(file_id, bot):
@@ -141,15 +197,23 @@ def generate_driver_pdf(driver_id, driver_name, driver_logs, driver_salaries, dr
             in_time = log.get('in', 'N/A')
             out_time = log.get('out', 'N/A')
             
+            # 格式化时间，去除国际时间部分
+            if in_time != 'N/A' and in_time != 'OFF':
+                in_time = format_local_time(in_time)
+            if out_time != 'N/A' and out_time != 'OFF':
+                out_time = format_local_time(out_time)
+            
             # Calculate hours if both in and out times exist
             hours = 'N/A'
             if in_time != 'N/A' and out_time != 'N/A' and in_time != 'OFF':
                 try:
-                    # Parse times
-                    in_dt = datetime.datetime.strptime(in_time, "%Y-%m-%d %H:%M:%S")
-                    out_dt = datetime.datetime.strptime(out_time, "%Y-%m-%d %H:%M:%S")
+                    # 解析时间
+                    in_dt = datetime.datetime.strptime(in_time, "%Y-%m-%d %H:%M")
+                    out_dt = datetime.datetime.strptime(out_time, "%Y-%m-%d %H:%M")
                     duration = out_dt - in_dt
-                    hours = f"{duration.total_seconds() / 3600:.2f}"
+                    hours_float = duration.total_seconds() / 3600
+                    # 使用新的格式化函数
+                    hours = format_duration(hours_float)
                 except:
                     hours = 'Error'
             elif in_time == 'OFF':
@@ -234,18 +298,73 @@ def generate_driver_pdf(driver_id, driver_name, driver_logs, driver_salaries, dr
     
     elements.append(Spacer(1, 20))
     
-    # Summary Section
+    # 增强的Summary Section
     elements.append(Paragraph("Summary", custom_heading_style))
     elements.append(Spacer(1, 6))
     
-    # Get balance
+    # 获取月份日期范围
+    first_day, last_day = get_month_date_range()
+    period_text = f"Summary Period: {first_day.strftime('%Y-%m-%d')} to {last_day.strftime('%Y-%m-%d')}"
+    elements.append(Paragraph(period_text, custom_normal_style))
+    elements.append(Spacer(1, 6))
+    
+    # 工资计算
+    gross_pay = total_hours * HOURLY_RATE
+    pay_text = f"Hourly Rate: RM{HOURLY_RATE:.2f}\nTotal Hours: {format_duration(total_hours)}\nGross Pay: RM{gross_pay:.2f}"
+    elements.append(Paragraph(pay_text, custom_normal_style))
+    elements.append(Spacer(1, 12))
+    
+    # Get balance and account flow
     balance = 0
     if driver_id in driver_accounts:
         balance = driver_accounts[driver_id].get('balance', 0)
     
+    # 账户流动明细
+    elements.append(Paragraph("Account Transactions:", custom_normal_style))
+    
+    # 充值记录
+    topup_history = get_topup_history(driver_id)
+    if topup_history:
+        elements.append(Paragraph("Topups:", custom_normal_style))
+        topup_data = [['Date', 'Amount']]
+        for topup in topup_history:
+            topup_data.append([topup.get('date', 'N/A'), f"RM{topup.get('amount', 0):.2f}"])
+        
+        topup_table = Table(topup_data, colWidths=[120, 120])
+        topup_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.lightgreen),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black),
+            ('ALIGN', (0, 0), (-1, 0), 'CENTER'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ]))
+        elements.append(topup_table)
+        elements.append(Spacer(1, 6))
+    
+    # 报销扣除记录
+    if claims:
+        elements.append(Paragraph("Claim Deductions:", custom_normal_style))
+        claim_data = [['Date', 'Type', 'Amount']]
+        for claim in claims:
+            claim_data.append([
+                claim.get('date', 'N/A'), 
+                claim.get('type', 'N/A'), 
+                f"RM{claim.get('amount', 0):.2f}"
+            ])
+        
+        claim_deduct_table = Table(claim_data, colWidths=[80, 120, 80])
+        claim_deduct_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.salmon),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black),
+            ('ALIGN', (0, 0), (-1, 0), 'CENTER'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ]))
+        elements.append(claim_deduct_table)
+        elements.append(Spacer(1, 12))
+    
+    # 最终余额表格
     summary_data = [
         ['Total Hours', 'Total Claims', 'Account Balance'],
-        [f"{total_hours:.2f} hours", f"RM{total_claims:.2f}", f"RM{balance:.2f}"]
+        [format_duration(total_hours), f"RM{total_claims:.2f}", f"RM{balance:.2f}"]
     ]
     
     summary_table = Table(summary_data, colWidths=[120, 120, 120])
@@ -307,6 +426,37 @@ def generate_all_drivers_pdf(driver_logs, driver_salaries, driver_accounts, bot,
     
     return pdf_files
 
+def generate_single_driver_pdf(driver_id, driver_logs, driver_salaries, driver_accounts, bot, output_dir):
+    """Generate PDF report for a single driver and return the file path"""
+    
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    try:
+        # Get driver name
+        try:
+            chat = bot.get_chat(driver_id)
+            driver_name = f"@{chat.username}" if chat.username else chat.first_name
+        except:
+            driver_name = f"Driver {driver_id}"
+        
+        # Generate PDF
+        output_path = os.path.join(output_dir, f"driver_{driver_id}.pdf")
+        generate_driver_pdf(
+            driver_id, 
+            driver_name, 
+            driver_logs, 
+            driver_salaries, 
+            driver_accounts, 
+            bot, 
+            output_path
+        )
+        
+        return output_path
+    except Exception as e:
+        logger.error(f"Error generating PDF for driver {driver_id}: {str(e)}")
+        return None
+
 # === 错误处理函数 ===
 def error_handler(update, context):
     """处理所有未捕获的异常"""
@@ -334,7 +484,7 @@ def start(update, context):
 
     driver_logs.setdefault(user_id, {})
     driver_salaries.setdefault(user_id, {"total_hours": 0.0, "daily_log": {}})
-    driver_accounts.setdefault(user_id, {"balance": 0.0, "claims": []})
+    driver_accounts.setdefault(user_id, {"balance": 0.0, "claims": [], "topup_history": []})
 
     msg = (
         f"👋 Hello {user.first_name}!\n"
@@ -367,14 +517,14 @@ def clockin(update, context):
     clock_time = now.strftime("%Y-%m-%d %H:%M:%S")
 
     driver_logs.setdefault(user_id, {}).setdefault(today, {})['in'] = clock_time
-    update.message.reply_text(f"✅ Clocked in at {clock_time}")
+    update.message.reply_text(f"✅ Clocked in at {format_local_time(clock_time)}")
     logger.info(f"User {username} clocked in at {clock_time}")
 
 # === /clockout ===
 def clockout(update, context):
     user_id = update.effective_user.id
     username = update.effective_user.username or str(user_id)
-    now = datetime.datetime.now(tz)  # 修复：ttz -> tz
+    now = datetime.datetime.now(tz)
     today = now.strftime("%Y-%m-%d")
     clock_time = now.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -409,15 +559,15 @@ def clockout(update, context):
         
         # 计算小时和分钟
         hours = int(total_seconds // 3600)
-        minutes = int((total_seconds % 3600) // 60)  # 修复：使用整除而不是取模
+        minutes = int((total_seconds % 3600) // 60)
         
         # 格式化时间字符串
         if hours and minutes:
-            time_str = f"{hours} hours {minutes} minutes"
+            time_str = f"{hours}Hour {minutes}Min"
         elif hours:
-            time_str = f"{hours} hours"
+            time_str = f"{hours}Hour"
         else:
-            time_str = f"{minutes} minutes"
+            time_str = f"{minutes}Min"
 
         # 确保薪资记录存在
         if user_id not in driver_salaries:
@@ -428,7 +578,7 @@ def clockout(update, context):
         driver_salaries[user_id]['total_hours'] += hours_worked
         driver_salaries[user_id]['daily_log'][today] = hours_worked
 
-        update.message.reply_text(f"🏁 Clocked out at {clock_time}. Worked {time_str}.")
+        update.message.reply_text(f"🏁 Clocked out at {format_local_time(clock_time)}. Worked {time_str}.")
         logger.info(f"User {username} clocked out: worked {time_str}")
     except Exception as e:
         # 记录错误日志
@@ -480,7 +630,13 @@ def check(update, context):
     for uid, log in driver_logs.items():
         day = log.get(today, {})
         in_time = day.get("in", "❌")
+        if in_time != "❌" and in_time != "OFF":
+            in_time = format_local_time(in_time)
+            
         out_time = day.get("out", "❌")
+        if out_time != "❌" and out_time != "OFF":
+            out_time = format_local_time(out_time)
+            
         try:
             chat = bot.get_chat(uid)
             name = f"@{chat.username}" if chat.username else chat.first_name
@@ -513,16 +669,73 @@ def viewclaims(update, context):
 
     update.message.reply_text(msg)
 
-# === /PDF (管理员) ===
-def generate_pdf(update, context):
+# === /PDF (管理员) - 新版本，支持选择司机 ===
+def pdf_start(update, context):
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
         return update.message.reply_text("❌ You are not an admin.")
     
-    logger.info(f"Admin {user_id} requested PDF generation")
+    logger.info(f"Admin {user_id} started PDF generation process")
     
-    update.message.reply_text("🔄 Generating PDF reports for all drivers. This may take a moment...")
+    # 创建司机选择键盘
+    keyboard = []
+    pdf_state[user_id] = {}
     
+    # 添加"所有司机"选项
+    keyboard.append([InlineKeyboardButton("📊 All Drivers", callback_data="pdf_all")])
+    
+    # 添加单个司机选项
+    for uid in driver_accounts.keys():
+        try:
+            chat = bot.get_chat(uid)
+            name = f"@{chat.username}" if chat.username else chat.first_name
+            keyboard.append([InlineKeyboardButton(f"👤 {name}", callback_data=f"pdf_{uid}")])
+            pdf_state[user_id][f"pdf_{uid}"] = uid
+        except Exception as e:
+            logger.error(f"Error getting chat for user {uid}: {str(e)}")
+            name = f"User {uid}"
+            keyboard.append([InlineKeyboardButton(f"👤 {name}", callback_data=f"pdf_{uid}")])
+            pdf_state[user_id][f"pdf_{uid}"] = uid
+
+    if len(keyboard) <= 1:  # 只有"所有司机"选项
+        update.message.reply_text("❌ No drivers found.")
+        return
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    update.message.reply_text(
+        "🧾 Select driver for PDF report:",
+        reply_markup=reply_markup
+    )
+
+def pdf_button_callback(update, context):
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    if user_id not in ADMIN_IDS:
+        query.answer("❌ You are not an admin.")
+        return
+    
+    query.answer()  # 通知Telegram已处理回调
+    
+    callback_data = query.data
+    logger.info(f"Admin {user_id} selected: {callback_data}")
+    
+    # 处理"所有司机"选项
+    if callback_data == "pdf_all":
+        query.edit_message_text("🔄 Generating PDF reports for all drivers. This may take a moment...")
+        generate_all_pdfs(query)
+        return
+    
+    # 处理单个司机选项
+    if user_id in pdf_state and callback_data in pdf_state[user_id]:
+        driver_id = pdf_state[user_id][callback_data]
+        query.edit_message_text(f"🔄 Generating PDF report. This may take a moment...")
+        generate_single_pdf(query, driver_id)
+    else:
+        query.edit_message_text("❌ Invalid selection or session expired.")
+
+def generate_all_pdfs(query):
+    """生成所有司机的PDF报告"""
     try:
         # Create temp directory for PDFs
         temp_dir = tempfile.mkdtemp()
@@ -537,28 +750,71 @@ def generate_pdf(update, context):
         )
         
         if not pdf_files:
-            update.message.reply_text("❌ No driver data available to generate PDFs.")
+            query.edit_message_text("❌ No driver data available to generate PDFs.")
             return
         
         # Send each PDF
         for pdf_file in pdf_files:
             try:
                 with open(pdf_file, 'rb') as f:
-                    update.message.reply_document(
+                    bot.send_document(
+                        chat_id=query.message.chat_id,
                         document=f,
                         filename=os.path.basename(pdf_file),
                         caption="Driver Report"
                     )
             except Exception as e:
                 logger.error(f"Error sending PDF: {str(e)}")
-                update.message.reply_text(f"❌ Error sending PDF: {str(e)}")
+                bot.send_message(
+                    chat_id=query.message.chat_id,
+                    text=f"❌ Error sending PDF: {str(e)}"
+                )
         
-        update.message.reply_text(f"✅ Generated {len(pdf_files)} PDF reports.")
+        query.edit_message_text(f"✅ Generated {len(pdf_files)} PDF reports.")
         
     except Exception as e:
         logger.error(f"PDF generation error: {str(e)}")
         logger.exception(e)
-        update.message.reply_text(f"❌ Error generating PDFs: {str(e)}")
+        query.edit_message_text(f"❌ Error generating PDFs: {str(e)}")
+
+def generate_single_pdf(query, driver_id):
+    """生成单个司机的PDF报告"""
+    try:
+        # Create temp directory for PDF
+        temp_dir = tempfile.mkdtemp()
+        
+        # Generate PDF
+        pdf_file = generate_single_driver_pdf(
+            driver_id, 
+            driver_logs, 
+            driver_salaries, 
+            driver_accounts, 
+            bot, 
+            temp_dir
+        )
+        
+        if not pdf_file:
+            query.edit_message_text("❌ No data available to generate PDF.")
+            return
+        
+        # Send PDF
+        try:
+            with open(pdf_file, 'rb') as f:
+                bot.send_document(
+                    chat_id=query.message.chat_id,
+                    document=f,
+                    filename=os.path.basename(pdf_file),
+                    caption="Driver Report"
+                )
+            query.edit_message_text("✅ PDF report generated successfully.")
+        except Exception as e:
+            logger.error(f"Error sending PDF: {str(e)}")
+            query.edit_message_text(f"❌ Error sending PDF: {str(e)}")
+        
+    except Exception as e:
+        logger.error(f"PDF generation error: {str(e)}")
+        logger.exception(e)
+        query.edit_message_text(f"❌ Error generating PDF: {str(e)}")
 
 # === /topup (交互流程管理员专用) ===
 def topup_start(update, context):
@@ -616,8 +872,17 @@ def topup_amount(update, context):
             update.message.reply_text("❌ Error: No user selected.")
             return ConversationHandler.END
             
-        driver_accounts.setdefault(uid, {"balance": 0.0, "claims": []})
+        driver_accounts.setdefault(uid, {"balance": 0.0, "claims": [], "topup_history": []})
         driver_accounts[uid]["balance"] += amount
+        
+        # 记录充值历史
+        today = datetime.datetime.now(tz).strftime("%Y-%m-%d")
+        topup_record = {
+            "date": today,
+            "amount": amount,
+            "admin": admin_id
+        }
+        driver_accounts[uid]["topup_history"].append(topup_record)
         
         try:
             chat = bot.get_chat(uid)
@@ -707,7 +972,7 @@ def claim_proof(update, context):
         "photo": file_id  # 只保存 file_id，后续 PDF 会用到
     }
 
-    driver_accounts.setdefault(user_id, {"balance": 0.0, "claims": []})
+    driver_accounts.setdefault(user_id, {"balance": 0.0, "claims": [], "topup_history": []})
     driver_accounts[user_id]["claims"].append(entry)
     driver_accounts[user_id]["balance"] -= entry["amount"]
 
@@ -729,6 +994,8 @@ def cancel(update, context):
         del claim_state[user_id]
     if user_id in topup_state:
         del topup_state[user_id]
+    if user_id in pdf_state:
+        del pdf_state[user_id]
     
     logger.info(f"User {username} cancelled operation")
     
@@ -749,7 +1016,8 @@ dispatcher.add_handler(CommandHandler("offday", offday))
 dispatcher.add_handler(CommandHandler("balance", balance))
 dispatcher.add_handler(CommandHandler("check", check))
 dispatcher.add_handler(CommandHandler("viewclaims", viewclaims))
-dispatcher.add_handler(CommandHandler("PDF", generate_pdf))
+dispatcher.add_handler(CommandHandler("PDF", pdf_start))
+dispatcher.add_handler(CallbackQueryHandler(pdf_button_callback, pattern=r'^pdf_'))
 
 # === topup handler ===
 dispatcher.add_handler(ConversationHandler(
