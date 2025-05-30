@@ -351,7 +351,7 @@ def error_handler(update, context):
     except:
         logger.error("Failed to send error message to user")
     tb_list = traceback.format_exception(None, context.error, context.error.__traceback__)
-    tb_string = ".join(tb_list)
+    tb_string = ".join(tb_list)"
     logger.error(f"Full traceback:\n{tb_string}")
 
 # === /start (使用数据库) ===
