@@ -1,4 +1,4 @@
-from flask import Flask, request
+from flask import Flask, request, send_file, render_template_string
 from telegram import (
     Bot, Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
 )
@@ -13,15 +13,14 @@ import traceback
 import tempfile
 import requests
 import calendar
+import sqlite3
+import json
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-
-# Import database utility functions
-import db_utils
 
 # === 日志设置 ===
 logging.basicConfig(
@@ -37,7 +36,6 @@ DEFAULT_HOURLY_RATE = 20.00
 DEFAULT_MONTHLY_SALARY = 3500.00
 WORKING_DAYS_PER_MONTH = 22
 WORKING_HOURS_PER_DAY = 8
-PHOTO_SERVER_BASE_URL = os.environ.get("PHOTO_SERVER_URL", "http://127.0.0.1:5001") # URL for the photo server
 
 # === 初始化 ===
 app = Flask(__name__)
@@ -45,7 +43,7 @@ bot = Bot(token=TOKEN)
 dispatcher = Dispatcher(bot, None, use_context=True)
 
 # 确保数据库已初始化
-db_utils.initialize_database()
+initialize_database()  # 直接调用初始化函数
 
 # === 时区 ===
 tz = pytz.timezone("Asia/Kuala_Lumpur")
@@ -56,7 +54,388 @@ CLAIM_TYPE, CLAIM_OTHER_TYPE, CLAIM_AMOUNT, CLAIM_PROOF = range(4)
 PDF_SELECT_DRIVER = range(1)
 SALARY_SELECT_DRIVER, SALARY_ENTER_AMOUNT = range(2)
 
-# === 辅助函数 (保持不变) ===
+# === 数据库初始化函数 ===
+def initialize_database():
+    """Initialize the SQLite database and create tables if they don't exist."""
+    try:
+        conn = sqlite3.connect("bot_data.db")
+        cursor = conn.cursor()
+
+        # Create drivers table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS drivers (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT
+            )
+        """)
+
+        # Create clock_logs table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS clock_logs (
+                log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                driver_id INTEGER NOT NULL,
+                date TEXT NOT NULL,
+                clock_in_time TEXT,
+                clock_out_time TEXT,
+                FOREIGN KEY (driver_id) REFERENCES drivers (user_id)
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_clock_logs_driver_date ON clock_logs (driver_id, date)")
+
+        # Create salaries table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS salaries (
+                driver_id INTEGER PRIMARY KEY,
+                monthly_salary REAL,
+                total_hours REAL DEFAULT 0.0,
+                daily_log_json TEXT,
+                FOREIGN KEY (driver_id) REFERENCES drivers (user_id)
+            )
+        """)
+
+        # Create accounts table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS accounts (
+                driver_id INTEGER PRIMARY KEY,
+                balance REAL DEFAULT 0.0,
+                FOREIGN KEY (driver_id) REFERENCES drivers (user_id)
+            )
+        """)
+
+        # Create claims table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS claims (
+                claim_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                driver_id INTEGER NOT NULL,
+                date TEXT NOT NULL,
+                type TEXT NOT NULL,
+                amount REAL NOT NULL,
+                photo_file_id TEXT,
+                FOREIGN KEY (driver_id) REFERENCES drivers (user_id)
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_claims_driver_date ON claims (driver_id, date)")
+
+        # Create topups table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS topups (
+                topup_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                driver_id INTEGER NOT NULL,
+                date TEXT NOT NULL,
+                amount REAL NOT NULL,
+                admin_id INTEGER NOT NULL,
+                FOREIGN KEY (driver_id) REFERENCES drivers (user_id)
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_topups_driver_date ON topups (driver_id, date)")
+
+        conn.commit()
+        conn.close()
+        logger.info("Database initialized successfully.")
+    except sqlite3.Error as e:
+        logger.error(f"Database initialization error: {e}")
+        raise
+
+# === 数据库辅助函数 ===
+def get_db_connection():
+    """Establish and return a database connection."""
+    conn = sqlite3.connect("bot_data.db")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def ensure_driver_exists(user_id, username, first_name):
+    """Ensure a driver exists in the database."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR IGNORE INTO drivers (user_id, username, first_name) VALUES (?, ?, ?)",
+                       (user_id, username, first_name))
+        cursor.execute("UPDATE drivers SET username = ?, first_name = ? WHERE user_id = ?",
+                       (username, first_name, user_id))
+        conn.commit()
+    except sqlite3.Error as e:
+        logger.error(f"DB Error (ensure_driver_exists): {e}")
+    finally:
+        conn.close()
+
+def get_driver_name(user_id):
+    """Get driver's name from the database."""
+    conn = get_db_connection()
+    name = f"User {user_id}"
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT username, first_name FROM drivers WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        if row:
+            name = f"@{row['username']}" if row['username'] else row['first_name']
+    except sqlite3.Error as e:
+        logger.error(f"DB Error (get_driver_name): {e}")
+    finally:
+        conn.close()
+    return name
+
+def get_all_driver_ids():
+    """Get a list of all driver user IDs."""
+    conn = get_db_connection()
+    ids = []
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id FROM drivers")
+        rows = cursor.fetchall()
+        ids = [row['user_id'] for row in rows]
+    except sqlite3.Error as e:
+        logger.error(f"DB Error (get_all_driver_ids): {e}")
+    finally:
+        conn.close()
+    return ids
+
+def save_clock_in(driver_id, date, clock_in_time):
+    """Save clock-in time."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT log_id FROM clock_logs WHERE driver_id = ? AND date = ?", (driver_id, date))
+        existing_log = cursor.fetchone()
+        if existing_log:
+            cursor.execute("UPDATE clock_logs SET clock_in_time = ?, clock_out_time = NULL WHERE log_id = ?",
+                           (clock_in_time, existing_log['log_id']))
+        else:
+            cursor.execute("INSERT INTO clock_logs (driver_id, date, clock_in_time) VALUES (?, ?, ?)",
+                           (driver_id, date, clock_in_time))
+        conn.commit()
+    except sqlite3.Error as e:
+        logger.error(f"DB Error (save_clock_in): {e}")
+    finally:
+        conn.close()
+
+def save_clock_out(driver_id, date, clock_out_time):
+    """Save clock-out time."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE clock_logs SET clock_out_time = ? WHERE driver_id = ? AND date = ?",
+                       (clock_out_time, driver_id, date))
+        conn.commit()
+    except sqlite3.Error as e:
+        logger.error(f"DB Error (save_clock_out): {e}")
+    finally:
+        conn.close()
+
+def save_off_day(driver_id, date):
+    """Mark a day as off."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR REPLACE INTO clock_logs (driver_id, date, clock_in_time, clock_out_time) VALUES (?, ?, ?, ?)",
+                       (driver_id, date, 'OFF', 'OFF'))
+        conn.commit()
+    except sqlite3.Error as e:
+        logger.error(f"DB Error (save_off_day): {e}")
+    finally:
+        conn.close()
+
+def get_clock_log(driver_id, date):
+    """Get clock log for a specific driver and date."""
+    conn = get_db_connection()
+    log = None
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT clock_in_time, clock_out_time FROM clock_logs WHERE driver_id = ? AND date = ?",
+                       (driver_id, date))
+        row = cursor.fetchone()
+        if row:
+            log = {'in': row['clock_in_time'], 'out': row['clock_out_time']}
+    except sqlite3.Error as e:
+        logger.error(f"DB Error (get_clock_log): {e}")
+    finally:
+        conn.close()
+    return log
+
+def get_driver_clock_logs(driver_id):
+    """Get all clock logs for a driver, ordered by date descending."""
+    conn = get_db_connection()
+    logs = {}
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT date, clock_in_time, clock_out_time FROM clock_logs WHERE driver_id = ? ORDER BY date DESC",
+                       (driver_id,))
+        rows = cursor.fetchall()
+        for row in rows:
+            logs[row['date']] = {'in': row['clock_in_time'], 'out': row['clock_out_time']}
+    except sqlite3.Error as e:
+        logger.error(f"DB Error (get_driver_clock_logs): {e}")
+    finally:
+        conn.close()
+    return logs
+
+def update_driver_salary(driver_id, total_hours_increment, date, hours_worked_today):
+    """Update driver's total hours and daily log."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR IGNORE INTO salaries (driver_id, total_hours, daily_log_json) VALUES (?, 0.0, '{}')", (driver_id,))
+
+        cursor.execute("SELECT total_hours, daily_log_json FROM salaries WHERE driver_id = ?", (driver_id,))
+        row = cursor.fetchone()
+        current_total_hours = row['total_hours'] if row else 0.0
+        daily_log = json.loads(row['daily_log_json']) if row and row['daily_log_json'] else {}
+
+        new_total_hours = current_total_hours + total_hours_increment
+        daily_log[date] = hours_worked_today
+        new_daily_log_json = json.dumps(daily_log)
+
+        cursor.execute("UPDATE salaries SET total_hours = ?, daily_log_json = ? WHERE driver_id = ?",
+                       (new_total_hours, new_daily_log_json, driver_id))
+        conn.commit()
+    except sqlite3.Error as e:
+        logger.error(f"DB Error (update_driver_salary): {e}")
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON Error (update_driver_salary): {e}")
+    finally:
+        conn.close()
+
+def set_monthly_salary(driver_id, monthly_salary):
+    """Set the monthly salary for a driver."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR IGNORE INTO salaries (driver_id) VALUES (?)", (driver_id,))
+        cursor.execute("UPDATE salaries SET monthly_salary = ? WHERE driver_id = ?", (monthly_salary, driver_id))
+        conn.commit()
+    except sqlite3.Error as e:
+        logger.error(f"DB Error (set_monthly_salary): {e}")
+    finally:
+        conn.close()
+
+def get_driver_salary_info(driver_id):
+    """Get salary info (total hours, monthly salary) for a driver."""
+    conn = get_db_connection()
+    info = {'total_hours': 0.0, 'monthly_salary': None}
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT total_hours, monthly_salary FROM salaries WHERE driver_id = ?", (driver_id,))
+        row = cursor.fetchone()
+        if row:
+            info['total_hours'] = row['total_hours'] if row['total_hours'] is not None else 0.0
+            info['monthly_salary'] = row['monthly_salary']
+    except sqlite3.Error as e:
+        logger.error(f"DB Error (get_driver_salary_info): {e}")
+    finally:
+        conn.close()
+    return info
+
+def update_account_balance(driver_id, amount_change):
+    """Update driver's account balance."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR IGNORE INTO accounts (driver_id, balance) VALUES (?, 0.0)", (driver_id,))
+        cursor.execute("UPDATE accounts SET balance = balance + ? WHERE driver_id = ?", (amount_change, driver_id))
+        conn.commit()
+    except sqlite3.Error as e:
+        logger.error(f"DB Error (update_account_balance): {e}")
+    finally:
+        conn.close()
+
+def get_account_balance(driver_id):
+    """Get driver's account balance."""
+    conn = get_db_connection()
+    balance = 0.0
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT balance FROM accounts WHERE driver_id = ?", (driver_id,))
+        row = cursor.fetchone()
+        if row:
+            balance = row['balance'] if row['balance'] is not None else 0.0
+    except sqlite3.Error as e:
+        logger.error(f"DB Error (get_account_balance): {e}")
+    finally:
+        conn.close()
+    return balance
+
+def get_all_balances():
+    """Get balances for all drivers."""
+    conn = get_db_connection()
+    balances = {}
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT driver_id, balance FROM accounts")
+        rows = cursor.fetchall()
+        for row in rows:
+            balances[row['driver_id']] = row['balance'] if row['balance'] is not None else 0.0
+    except sqlite3.Error as e:
+        logger.error(f"DB Error (get_all_balances): {e}")
+    finally:
+        conn.close()
+    return balances
+
+def save_claim(driver_id, date, claim_type, amount, photo_file_id):
+    """Save a new claim."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO claims (driver_id, date, type, amount, photo_file_id) VALUES (?, ?, ?, ?, ?)",
+                       (driver_id, date, claim_type, amount, photo_file_id))
+        conn.commit()
+        update_account_balance(driver_id, -amount)
+    except sqlite3.Error as e:
+        logger.error(f"DB Error (save_claim): {e}")
+    finally:
+        conn.close()
+
+def get_driver_claims(driver_id, limit=None):
+    """Get claims for a specific driver, optionally limited."""
+    conn = get_db_connection()
+    claims_list = []
+    try:
+        cursor = conn.cursor()
+        query = "SELECT claim_id, date, type, amount, photo_file_id FROM claims WHERE driver_id = ? ORDER BY date DESC, claim_id DESC"
+        params = (driver_id,)
+        if limit:
+            query += " LIMIT ?"
+            params += (limit,)
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        for row in rows:
+            claims_list.append(dict(row))
+    except sqlite3.Error as e:
+        logger.error(f"DB Error (get_driver_claims): {e}")
+    finally:
+        conn.close()
+    return claims_list
+
+def save_topup(driver_id, date, amount, admin_id):
+    """Save a new topup record."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO topups (driver_id, date, amount, admin_id) VALUES (?, ?, ?, ?)",
+                       (driver_id, date, amount, admin_id))
+        conn.commit()
+        update_account_balance(driver_id, amount)
+    except sqlite3.Error as e:
+        logger.error(f"DB Error (save_topup): {e}")
+    finally:
+        conn.close()
+
+def get_driver_topups(driver_id):
+    """Get topup history for a driver."""
+    conn = get_db_connection()
+    topups_list = []
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT date, amount FROM topups WHERE driver_id = ? ORDER BY date DESC", (driver_id,))
+        rows = cursor.fetchall()
+        for row in rows:
+            topups_list.append(dict(row))
+    except sqlite3.Error as e:
+        logger.error(f"DB Error (get_driver_topups): {e}")
+    finally:
+        conn.close()
+    return topups_list
+
+# === 辅助函数 ===
 def format_local_time(timestamp_str):
     """将时间戳字符串转换为本地时间格式，去除国际时间部分"""
     try:
@@ -101,12 +480,12 @@ def calculate_hourly_rate(monthly_salary):
 
 def get_driver_hourly_rate(driver_id):
     """获取司机的时薪 (从数据库)"""
-    salary_info = db_utils.get_driver_salary_info(driver_id)
+    salary_info = get_driver_salary_info(driver_id)
     if salary_info and salary_info["monthly_salary"] is not None:
         return calculate_hourly_rate(salary_info["monthly_salary"])
     return DEFAULT_HOURLY_RATE
 
-# === PDF 生成功能 (需要修改以从数据库获取数据) ===
+# === PDF 生成功能 ===
 def download_telegram_photo(file_id, bot):
     """Download a photo from Telegram by file_id and save to a temporary file"""
     try:
@@ -120,12 +499,12 @@ def download_telegram_photo(file_id, bot):
 
 def generate_driver_pdf(driver_id, output_path):
     """Generate a PDF report for a single driver using data from DB."""
-    driver_name = db_utils.get_driver_name(driver_id)
-    driver_logs_db = db_utils.get_driver_clock_logs(driver_id)
-    driver_salary_info = db_utils.get_driver_salary_info(driver_id)
-    driver_claims = db_utils.get_driver_claims(driver_id)
-    driver_topups = db_utils.get_driver_topups(driver_id)
-    driver_balance = db_utils.get_account_balance(driver_id)
+    driver_name = get_driver_name(driver_id)
+    driver_logs_db = get_driver_clock_logs(driver_id)
+    driver_salary_info = get_driver_salary_info(driver_id)
+    driver_claims = get_driver_claims(driver_id)
+    driver_topups = get_driver_topups(driver_id)
+    driver_balance = get_account_balance(driver_id)
 
     doc = SimpleDocTemplate(
         output_path,
@@ -136,7 +515,7 @@ def generate_driver_pdf(driver_id, output_path):
         bottomMargin=72
     )
 
-    # Styles (保持不变)
+    # Styles
     styles = getSampleStyleSheet()
     custom_title_style = ParagraphStyle(name="CustomTitle", fontName="Helvetica-Bold", fontSize=16, alignment=1, spaceAfter=12)
     custom_heading_style = ParagraphStyle(name="CustomHeading", fontName="Helvetica-Bold", fontSize=14, spaceAfter=6)
@@ -153,7 +532,7 @@ def generate_driver_pdf(driver_id, output_path):
     elements.append(Paragraph("Daily Clock Records", custom_heading_style))
     elements.append(Spacer(1, 6))
     clock_data = [["Date", "Clock In", "Clock Out", "Hours"]]
-    total_hours_calculated = 0 # Calculate from logs for display consistency
+    total_hours_calculated = 0
 
     for date, log in sorted(driver_logs_db.items(), reverse=True):
         in_time = log.get("in", "N/A")
@@ -193,7 +572,7 @@ def generate_driver_pdf(driver_id, output_path):
         clock_table.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.grey),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
-            ("ALIGN", (0, 0), (-1, -1), "CENTER"), # Center align all
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
             ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
             ("FONTSIZE", (0, 0), (-1, 0), 12),
             ("BOTTOMPADDING", (0, 0), (-1, 0), 12),
@@ -235,7 +614,6 @@ def generate_driver_pdf(driver_id, output_path):
                         img = Image(photo_path, width=300, height=200)
                         elements.append(img)
                         elements.append(Spacer(1, 6))
-                        # os.remove(photo_path) # Clean up temp file
                 except Exception as e:
                     elements.append(Paragraph(f"Error loading photo: {str(e)}", custom_normal_style))
             elements.append(Spacer(1, 10))
@@ -247,7 +625,7 @@ def generate_driver_pdf(driver_id, output_path):
     elements.append(Paragraph("Summary", custom_heading_style))
     elements.append(Spacer(1, 6))
     first_day, last_day = get_month_date_range()
-    period_text = f"Summary Period: {first_day.strftime("%Y-%m-%d")} to {last_day.strftime("%Y-%m-%d")}"
+    period_text = f"Summary Period: {first_day.strftime('%Y-%m-%d')} to {last_day.strftime('%Y-%m-%d')}"
     elements.append(Paragraph(period_text, custom_normal_style))
     elements.append(Spacer(1, 6))
 
@@ -266,7 +644,7 @@ def generate_driver_pdf(driver_id, output_path):
         elements.append(Paragraph("Topups:", custom_normal_style))
         topup_data = [["Date", "Amount"]]
         for topup in driver_topups:
-            topup_data.append([topup.get("date", "N/A"), f"RM{topup.get("amount", 0):.2f}"])
+            topup_data.append([topup.get("date", "N/A"), f"RM{topup.get('amount', 0):.2f}"])
         topup_table = Table(topup_data, colWidths=[120, 120])
         topup_table.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.lightgreen),
@@ -281,7 +659,7 @@ def generate_driver_pdf(driver_id, output_path):
         elements.append(Paragraph("Claim Deductions:", custom_normal_style))
         claim_data = [["Date", "Type", "Amount"]]
         for claim in driver_claims:
-            claim_data.append([claim.get("date", "N/A"), claim.get("type", "N/A"), f"RM{claim.get("amount", 0):.2f}"])
+            claim_data.append([claim.get("date", "N/A"), claim.get("type", "N/A"), f"RM{claim.get('amount', 0):.2f}"])
         claim_deduct_table = Table(claim_data, colWidths=[80, 120, 80])
         claim_deduct_table.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.salmon),
@@ -320,7 +698,7 @@ def generate_all_drivers_pdf(output_dir):
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
     pdf_files = []
-    driver_ids = db_utils.get_all_driver_ids()
+    driver_ids = get_all_driver_ids()
     for driver_id in driver_ids:
         try:
             output_path = os.path.join(output_dir, f"driver_{driver_id}.pdf")
@@ -342,7 +720,350 @@ def generate_single_driver_pdf_wrapper(driver_id, output_dir):
         logger.error(f"Error generating PDF for driver {driver_id}: {str(e)}")
         return None
 
-# === 错误处理函数 (保持不变) ===
+# === 照片服务器功能 ===
+TEMP_DIR = tempfile.mkdtemp()
+
+@app.route('/claims/')
+def claims_index():
+    """Main page showing claims list with pagination."""
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 5, type=int)
+    driver_id = request.args.get('driver_id', None, type=int)
+    
+    # Get all drivers for the filter dropdown
+    drivers = []
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id, username, first_name FROM drivers")
+        for row in cursor.fetchall():
+            name = f"@{row['username']}" if row['username'] else row['first_name']
+            drivers.append({'id': row['user_id'], 'name': name})
+    except Exception as e:
+        logger.error(f"Error fetching drivers: {e}")
+    finally:
+        conn.close()
+    
+    # Get claims with pagination
+    claims = []
+    total_claims = 0
+    total_pages = 1
+    
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        
+        # Count query
+        count_query = "SELECT COUNT(*) FROM claims"
+        params = []
+        if driver_id:
+            count_query += " WHERE driver_id = ?"
+            params.append(driver_id)
+        
+        cursor.execute(count_query, params)
+        total_claims = cursor.fetchone()[0]
+        total_pages = (total_claims + per_page - 1) // per_page if total_claims > 0 else 1
+        
+        # Data query
+        offset = (page - 1) * per_page
+        data_query = """
+            SELECT c.claim_id, c.driver_id, c.date, c.type, c.amount, c.photo_file_id,
+                   d.username, d.first_name
+            FROM claims c
+            LEFT JOIN drivers d ON c.driver_id = d.user_id
+        """
+        if driver_id:
+            data_query += " WHERE c.driver_id = ?"
+            params.append(driver_id)
+        
+        data_query += " ORDER BY c.date DESC, c.claim_id DESC LIMIT ? OFFSET ?"
+        params.extend([per_page, offset])
+        
+        cursor.execute(data_query, params)
+        for row in cursor.fetchall():
+            driver_name = f"@{row['username']}" if row['username'] else row['first_name'] or f"User {row['driver_id']}"
+            claims.append({
+                'id': row['claim_id'],
+                'driver_id': row['driver_id'],
+                'driver_name': driver_name,
+                'date': row['date'],
+                'type': row['type'],
+                'amount': row['amount'],
+                'photo_file_id': row['photo_file_id']
+            })
+    except Exception as e:
+        logger.error(f"Error fetching claims: {e}")
+    finally:
+        conn.close()
+    
+    # HTML template
+    html_template = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Driver Claims</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                margin: 0;
+                padding: 20px;
+                background-color: #f5f5f5;
+            }
+            .container {
+                max-width: 1000px;
+                margin: 0 auto;
+                background-color: white;
+                padding: 20px;
+                border-radius: 8px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            }
+            h1 {
+                color: #333;
+                margin-top: 0;
+            }
+            .filters {
+                margin-bottom: 20px;
+                padding: 15px;
+                background-color: #f9f9f9;
+                border-radius: 5px;
+            }
+            .claim-card {
+                border: 1px solid #ddd;
+                border-radius: 5px;
+                padding: 15px;
+                margin-bottom: 15px;
+                background-color: white;
+            }
+            .claim-header {
+                display: flex;
+                justify-content: space-between;
+                margin-bottom: 10px;
+            }
+            .claim-details {
+                margin-bottom: 10px;
+            }
+            .claim-photo {
+                text-align: center;
+            }
+            .claim-photo img {
+                max-width: 100%;
+                max-height: 200px;
+                border-radius: 5px;
+            }
+            .pagination {
+                margin-top: 20px;
+                text-align: center;
+            }
+            .pagination a, .pagination span {
+                display: inline-block;
+                padding: 8px 16px;
+                text-decoration: none;
+                color: black;
+                border: 1px solid #ddd;
+                margin: 0 4px;
+            }
+            .pagination a:hover {
+                background-color: #ddd;
+            }
+            .pagination .active {
+                background-color: #4CAF50;
+                color: white;
+                border: 1px solid #4CAF50;
+            }
+            .modal {
+                display: none;
+                position: fixed;
+                z-index: 1;
+                left: 0;
+                top: 0;
+                width: 100%;
+                height: 100%;
+                overflow: auto;
+                background-color: rgba(0,0,0,0.9);
+            }
+            .modal-content {
+                margin: auto;
+                display: block;
+                max-width: 90%;
+                max-height: 90%;
+            }
+            .close {
+                position: absolute;
+                top: 15px;
+                right: 35px;
+                color: #f1f1f1;
+                font-size: 40px;
+                font-weight: bold;
+                transition: 0.3s;
+            }
+            .close:hover, .close:focus {
+                color: #bbb;
+                text-decoration: none;
+                cursor: pointer;
+            }
+            select, button {
+                padding: 8px;
+                border-radius: 4px;
+                border: 1px solid #ddd;
+            }
+            button {
+                background-color: #4CAF50;
+                color: white;
+                border: none;
+                cursor: pointer;
+            }
+            button:hover {
+                background-color: #45a049;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>Driver Claims</h1>
+            
+            <div class="filters">
+                <form action="/claims/" method="get">
+                    <label for="driver_id">Filter by Driver:</label>
+                    <select name="driver_id" id="driver_id">
+                        <option value="">All Drivers</option>
+                        {% for driver in drivers %}
+                        <option value="{{ driver.id }}" {% if driver_id == driver.id %}selected{% endif %}>
+                            {{ driver.name }}
+                        </option>
+                        {% endfor %}
+                    </select>
+                    <button type="submit">Apply Filter</button>
+                    {% if driver_id %}
+                    <a href="/claims/" style="margin-left: 10px;">Clear Filter</a>
+                    {% endif %}
+                </form>
+            </div>
+            
+            {% if claims %}
+                {% for claim in claims %}
+                <div class="claim-card">
+                    <div class="claim-header">
+                        <div><strong>{{ claim.driver_name }}</strong></div>
+                        <div>{{ claim.date }}</div>
+                    </div>
+                    <div class="claim-details">
+                        <div><strong>Type:</strong> {{ claim.type }}</div>
+                        <div><strong>Amount:</strong> RM{{ "%.2f"|format(claim.amount) }}</div>
+                    </div>
+                    {% if claim.photo_file_id %}
+                    <div class="claim-photo">
+                        <img src="/claims/photo/{{ claim.photo_file_id }}" 
+                             alt="Claim photo" 
+                             onclick="openModal('/claims/photo/{{ claim.photo_file_id }}')">
+                        <div>
+                            <a href="/claims/download/{{ claim.photo_file_id }}" target="_blank">Download Photo</a>
+                        </div>
+                    </div>
+                    {% else %}
+                    <div class="claim-photo">No photo available</div>
+                    {% endif %}
+                </div>
+                {% endfor %}
+                
+                <div class="pagination">
+                    {% if page > 1 %}
+                    <a href="{{ url_for('claims_index', page=page-1, driver_id=driver_id) }}">&laquo; Previous</a>
+                    {% endif %}
+                    
+                    {% for p in range(1, total_pages + 1) %}
+                        {% if p == page %}
+                        <span class="active">{{ p }}</span>
+                        {% else %}
+                        <a href="{{ url_for('claims_index', page=p, driver_id=driver_id) }}">{{ p }}</a>
+                        {% endif %}
+                    {% endfor %}
+                    
+                    {% if page < total_pages %}
+                    <a href="{{ url_for('claims_index', page=page+1, driver_id=driver_id) }}">Next &raquo;</a>
+                    {% endif %}
+                </div>
+            {% else %}
+                <p>No claims found.</p>
+            {% endif %}
+        </div>
+        
+        <!-- Modal for image preview -->
+        <div id="imageModal" class="modal">
+            <span class="close" onclick="closeModal()">&times;</span>
+            <img class="modal-content" id="modalImg">
+        </div>
+        
+        <script>
+            function openModal(imgSrc) {
+                var modal = document.getElementById("imageModal");
+                var modalImg = document.getElementById("modalImg");
+                modal.style.display = "block";
+                modalImg.src = imgSrc;
+            }
+            
+            function closeModal() {
+                document.getElementById("imageModal").style.display = "none";
+            }
+            
+            // Close modal when clicking outside the image
+            window.onclick = function(event) {
+                var modal = document.getElementById("imageModal");
+                if (event.target == modal) {
+                    modal.style.display = "none";
+                }
+            }
+        </script>
+    </body>
+    </html>
+    """
+    
+    return render_template_string(
+        html_template, 
+        claims=claims, 
+        drivers=drivers,
+        page=page, 
+        total_pages=total_pages,
+        driver_id=driver_id
+    )
+
+@app.route('/claims/photo/<file_id>')
+def claims_photo(file_id):
+    """Serve a photo by its Telegram file_id."""
+    try:
+        # Check if we already have this photo cached
+        photo_path = os.path.join(TEMP_DIR, f"{file_id}.jpg")
+        
+        if not os.path.exists(photo_path):
+            # Download from Telegram
+            file = bot.get_file(file_id)
+            file.download(photo_path)
+        
+        return send_file(photo_path, mimetype='image/jpeg')
+    except Exception as e:
+        logger.error(f"Error serving photo {file_id}: {e}")
+        return "Error loading photo", 500
+
+@app.route('/claims/download/<file_id>')
+def claims_download_photo(file_id):
+    """Download a photo by its Telegram file_id."""
+    try:
+        # Check if we already have this photo cached
+        photo_path = os.path.join(TEMP_DIR, f"{file_id}.jpg")
+        
+        if not os.path.exists(photo_path):
+            # Download from Telegram
+            file = bot.get_file(file_id)
+            file.download(photo_path)
+        
+        return send_file(photo_path, mimetype='image/jpeg', 
+                         download_name=f"claim_{file_id}.jpg", 
+                         as_attachment=True)
+    except Exception as e:
+        logger.error(f"Error downloading photo {file_id}: {e}")
+        return "Error downloading photo", 500
+
+# === 错误处理函数 ===
 def error_handler(update, context):
     logger.error("Exception while handling an update:", exc_info=context.error)
     try:
@@ -351,18 +1072,17 @@ def error_handler(update, context):
     except:
         logger.error("Failed to send error message to user")
     tb_list = traceback.format_exception(None, context.error, context.error.__traceback__)
-    tb_string = ".join(tb_list)"
+    tb_string = ''.join(tb_list)
     logger.error(f"Full traceback:\n{tb_string}")
 
-# === /start (使用数据库) ===
+# === /start ===
 def start(update, context):
     user = update.effective_user
     user_id = user.id
     username = user.username or str(user_id)
     first_name = user.first_name
 
-    # Ensure driver exists in DB
-    db_utils.ensure_driver_exists(user_id, username, first_name)
+    ensure_driver_exists(user_id, username, first_name)
 
     msg = (
         f"👋 Hello {first_name}!\n"
@@ -387,41 +1107,40 @@ def start(update, context):
     update.message.reply_text(msg)
     logger.info(f"User {username} (ID: {user_id}) started the bot")
 
-# === /clockin (使用数据库) ===
+# === /clockin ===
 def clockin(update, context):
     user = update.effective_user
     user_id = user.id
     username = user.username or str(user_id)
     first_name = user.first_name
-    db_utils.ensure_driver_exists(user_id, username, first_name) # Ensure driver exists
-
-    now = datetime.datetime.now(tz)
-    today = now.strftime("%Y-%m-%d")
-    clock_time = now.strftime("%Y-%m-%d %H:%M:%S") # Store with seconds for accuracy
-
-    db_utils.save_clock_in(user_id, today, clock_time)
-
-    local_time = format_local_time(clock_time)
-    update.message.reply_text(f"✅ Clocked in at {local_time}")
-    logger.info(f"User {username} clocked in at {clock_time}")
-
-# === /clockout (使用数据库) ===
-def clockout(update, context):
-    user = update.effective_user
-    user_id = user.id
-    username = user.username or str(user_id)
-    first_name = user.first_name
-    db_utils.ensure_driver_exists(user_id, username, first_name) # Ensure driver exists
+    ensure_driver_exists(user_id, username, first_name)
 
     now = datetime.datetime.now(tz)
     today = now.strftime("%Y-%m-%d")
     clock_time = now.strftime("%Y-%m-%d %H:%M:%S")
 
-    # Get clock-in time from DB
-    log = db_utils.get_clock_log(user_id, today)
+    save_clock_in(user_id, today, clock_time)
+
+    local_time = format_local_time(clock_time)
+    update.message.reply_text(f"✅ Clocked in at {local_time}")
+    logger.info(f"User {username} clocked in at {clock_time}")
+
+# === /clockout ===
+def clockout(update, context):
+    user = update.effective_user
+    user_id = user.id
+    username = user.username or str(user_id)
+    first_name = user.first_name
+    ensure_driver_exists(user_id, username, first_name)
+
+    now = datetime.datetime.now(tz)
+    today = now.strftime("%Y-%m-%d")
+    clock_time = now.strftime("%Y-%m-%d %H:%M:%S")
+
+    log = get_clock_log(user_id, today)
 
     if not log or not log.get("in") or log.get("in") == "OFF":
-        error_msg = "❌ You haven"t clocked in today or are marked as off."
+        error_msg = "❌ You haven't clocked in today or are marked as off."
         logger.warning(f"User {username}: {error_msg}")
         update.message.reply_text(error_msg)
         return
@@ -431,7 +1150,7 @@ def clockout(update, context):
          return
 
     try:
-        db_utils.save_clock_out(user_id, today, clock_time)
+        save_clock_out(user_id, today, clock_time)
 
         in_time_str = log["in"]
         naive_in_time = datetime.datetime.strptime(in_time_str, "%Y-%m-%d %H:%M:%S")
@@ -446,8 +1165,7 @@ def clockout(update, context):
         hours_worked = total_seconds / 3600
         time_str = format_duration(hours_worked)
 
-        # Update salary info in DB
-        db_utils.update_driver_salary(user_id, hours_worked, today, hours_worked)
+        update_driver_salary(user_id, hours_worked, today, hours_worked)
 
         local_time = format_local_time(clock_time)
         update.message.reply_text(f"🏁 Clocked out at {local_time}. Worked {time_str}.")
@@ -457,37 +1175,37 @@ def clockout(update, context):
         logger.exception(e)
         update.message.reply_text("⚠️ An error occurred during clockout. Please try again.")
 
-# === /offday (使用数据库) ===
+# === /offday ===
 def offday(update, context):
     user = update.effective_user
     user_id = user.id
     username = user.username or str(user_id)
     first_name = user.first_name
-    db_utils.ensure_driver_exists(user_id, username, first_name) # Ensure driver exists
+    ensure_driver_exists(user_id, username, first_name)
 
     today = datetime.datetime.now(tz).strftime("%Y-%m-%d")
-    db_utils.save_off_day(user_id, today)
+    save_off_day(user_id, today)
     update.message.reply_text(f"📅 Marked {today} as off day.")
     logger.info(f"User {username} marked {today} as off day")
 
-# === /balance（管理员, 使用数据库）===
+# === /balance（管理员）===
 def balance(update, context):
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
         return
     logger.info(f"Admin {user_id} requested balance")
 
-    balances = db_utils.get_all_balances()
+    balances = get_all_balances()
     msg = "📊 Driver Balances:\n"
     if not balances:
         msg += "No driver data found."
     else:
         for uid, bal in balances.items():
-            name = db_utils.get_driver_name(uid)
+            name = get_driver_name(uid)
             msg += f"• {name}: RM{bal:.2f}\n"
     update.message.reply_text(msg)
 
-# === /check（管理员, 使用数据库）===
+# === /check（管理员）===
 def check(update, context):
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
@@ -496,14 +1214,14 @@ def check(update, context):
 
     today = datetime.datetime.now(tz).strftime("%Y-%m-%d")
     msg = f"📄 Status for {today}:\n"
-    driver_ids = db_utils.get_all_driver_ids()
+    driver_ids = get_all_driver_ids()
 
     if not driver_ids:
         msg += "No drivers found."
     else:
         for uid in driver_ids:
-            log = db_utils.get_clock_log(uid, today)
-            name = db_utils.get_driver_name(uid)
+            log = get_clock_log(uid, today)
+            name = get_driver_name(uid)
             in_time_str = "❌"
             out_time_str = "❌"
             if log:
@@ -522,15 +1240,15 @@ def check(update, context):
             msg += f"• {name}: IN: {in_time_str}, OUT: {out_time_str}\n"
     update.message.reply_text(msg)
 
-# === /viewclaims（管理员, 使用Web界面）===
+# === /viewclaims（管理员）===
 def viewclaims(update, context):
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
         return update.message.reply_text("❌ You are not an admin.")
 
     logger.info(f"Admin {user_id} requested viewclaims")
-    # Send a link to the web interface
-    claims_url = f"{PHOTO_SERVER_BASE_URL}/"
+    # 使用主应用内的相对路径
+    claims_url = "/claims/"
     keyboard = [[InlineKeyboardButton("View Claims Online", url=claims_url)]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     update.message.reply_text(
@@ -538,7 +1256,7 @@ def viewclaims(update, context):
         reply_markup=reply_markup
     )
 
-# === /salary (管理员, 使用数据库) ===
+# === /salary (管理员) ===
 def salary_start(update, context):
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
@@ -547,14 +1265,14 @@ def salary_start(update, context):
 
     keyboard = []
     context.user_data["salary_driver_map"] = {}
-    driver_ids = db_utils.get_all_driver_ids()
+    driver_ids = get_all_driver_ids()
 
     if not driver_ids:
         update.message.reply_text("❌ No drivers found.")
         return ConversationHandler.END
 
     for uid in driver_ids:
-        name = db_utils.get_driver_name(uid)
+        name = get_driver_name(uid)
         keyboard.append([name])
         context.user_data["salary_driver_map"][name] = uid
 
@@ -578,10 +1296,10 @@ def salary_select_driver(update, context):
     context.user_data["salary_driver_id"] = driver_id
     context.user_data["salary_driver_name"] = selected
 
-    salary_info = db_utils.get_driver_salary_info(driver_id)
+    salary_info = get_driver_salary_info(driver_id)
     current_salary = "Not Set"
     if salary_info and salary_info["monthly_salary"] is not None:
-        current_salary = f"RM{salary_info["monthly_salary"]:.2f}"
+        current_salary = f"RM{salary_info['monthly_salary']:.2f}"
 
     update.message.reply_text(
         f"💰 Enter monthly salary for {selected}:\n"
@@ -601,7 +1319,7 @@ def salary_enter_amount(update, context):
             update.message.reply_text("❌ Error: No driver selected.")
             return ConversationHandler.END
 
-        db_utils.set_monthly_salary(driver_id, monthly_salary)
+        set_monthly_salary(driver_id, monthly_salary)
         hourly_rate = calculate_hourly_rate(monthly_salary)
 
         update.message.reply_text(
@@ -618,13 +1336,12 @@ def salary_enter_amount(update, context):
         logger.error(f"Salary setting error: {str(e)}")
         update.message.reply_text("❌ An error occurred during salary setting.")
     finally:
-        # Clean up user_data
         context.user_data.pop("salary_driver_id", None)
         context.user_data.pop("salary_driver_name", None)
         context.user_data.pop("salary_driver_map", None)
     return ConversationHandler.END
 
-# === /PDF (管理员, 使用数据库) ===
+# === /PDF (管理员) ===
 def pdf_start(update, context):
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
@@ -633,14 +1350,14 @@ def pdf_start(update, context):
 
     keyboard = [[InlineKeyboardButton("📊 All Drivers", callback_data="pdf_all")]]
     context.user_data["pdf_driver_map"] = {}
-    driver_ids = db_utils.get_all_driver_ids()
+    driver_ids = get_all_driver_ids()
 
     if not driver_ids:
         update.message.reply_text("❌ No drivers found.")
         return
 
     for uid in driver_ids:
-        name = db_utils.get_driver_name(uid)
+        name = get_driver_name(uid)
         keyboard.append([InlineKeyboardButton(f"👤 {name}", callback_data=f"pdf_{uid}")])
         context.user_data["pdf_driver_map"][f"pdf_{uid}"] = uid
 
@@ -678,7 +1395,7 @@ def pdf_button_callback(update, context):
             driver_map = context.user_data.get("pdf_driver_map", {})
             if callback_data in driver_map:
                 driver_id = driver_map[callback_data]
-                driver_name = db_utils.get_driver_name(driver_id)
+                driver_name = get_driver_name(driver_id)
                 query.edit_message_text(f"🔄 Generating PDF report for {driver_name}...")
                 pdf_file = generate_single_driver_pdf_wrapper(driver_id, temp_dir)
                 if not pdf_file:
@@ -698,12 +1415,9 @@ def pdf_button_callback(update, context):
         logger.exception(e)
         query.edit_message_text(f"❌ Error generating PDF(s): {str(e)}")
     finally:
-        # Clean up temp dir?
-        pass
-        # Clean up user_data
         context.user_data.pop("pdf_driver_map", None)
 
-# === /topup (交互流程管理员专用, 使用数据库) ===
+# === /topup (管理员) ===
 def topup_start(update, context):
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
@@ -712,14 +1426,14 @@ def topup_start(update, context):
 
     keyboard = []
     context.user_data["topup_driver_map"] = {}
-    driver_ids = db_utils.get_all_driver_ids()
+    driver_ids = get_all_driver_ids()
 
     if not driver_ids:
         update.message.reply_text("❌ No drivers found.")
         return ConversationHandler.END
 
     for uid in driver_ids:
-        name = db_utils.get_driver_name(uid)
+        name = get_driver_name(uid)
         keyboard.append([name])
         context.user_data["topup_driver_map"][name] = uid
 
@@ -754,9 +1468,9 @@ def topup_amount(update, context):
             return ConversationHandler.END
 
         today = datetime.datetime.now(tz).strftime("%Y-%m-%d")
-        db_utils.save_topup(uid, today, amount, admin_id)
+        save_topup(uid, today, amount, admin_id)
 
-        name = db_utils.get_driver_name(uid)
+        name = get_driver_name(uid)
         update.message.reply_text(f"✅ Topped up RM{amount:.2f} to {name}.")
         logger.info(f"Admin {admin_id} topped up RM{amount:.2f} to {name} (ID: {uid})")
     except ValueError:
@@ -770,13 +1484,13 @@ def topup_amount(update, context):
         context.user_data.pop("topup_driver_map", None)
     return ConversationHandler.END
 
-# === /claim 分阶段 (使用数据库) ===
+# === /claim 分阶段 ===
 def claim_start(update, context):
     user = update.effective_user
     user_id = user.id
     username = user.username or str(user_id)
     first_name = user.first_name
-    db_utils.ensure_driver_exists(user_id, username, first_name) # Ensure driver exists
+    ensure_driver_exists(user_id, username, first_name)
 
     logger.info(f"User {username} started claim process")
     context.user_data["claim_info"] = {}
@@ -842,8 +1556,7 @@ def claim_proof(update, context):
             update.message.reply_text("❌ Error: Claim information missing. Please start again with /claim.")
             return ConversationHandler.END
 
-        # Save claim to DB
-        db_utils.save_claim(user_id, date, claim_type, amount, file_id)
+        save_claim(user_id, date, claim_type, amount, file_id)
 
         response = f"✅ RM{amount:.2f} claimed for {claim_type} on {date}."
         update.message.reply_text(response)
@@ -859,14 +1572,13 @@ def cancel(update, context):
     user_id = update.effective_user.id
     username = update.effective_user.username or str(user_id)
     update.message.reply_text("❌ Operation cancelled.", reply_markup=ReplyKeyboardRemove())
-    # Clean up user_data for all conversations
     keys_to_pop = [k for k in context.user_data if k.startswith(("claim_", "topup_", "pdf_", "salary_"))]
     for key in keys_to_pop:
         context.user_data.pop(key, None)
     logger.info(f"User {username} cancelled operation")
     return ConversationHandler.END
 
-# === Webhook (保持不变) ===
+# === Webhook ===
 @app.route(f"/{TOKEN}", methods=["POST"])
 def webhook():
     update = Update.de_json(request.get_json(force=True), bot)
@@ -919,9 +1631,9 @@ dispatcher.add_handler(ConversationHandler(
 # Error handler
 dispatcher.add_error_handler(error_handler)
 
-# === Run (保持不变) ===
+# === Run ===
 if __name__ == "__main__":
     logger.info("Bot server started.")
-    # Note: This Flask app is only for the webhook.
-    # The photo server runs separately.
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    port = int(os.environ.get("PORT", 5000))
+    logger.info(f"Starting on port: {port}")
+    app.run(host="0.0.0.0", port=port)
