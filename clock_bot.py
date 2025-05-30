@@ -19,12 +19,28 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
-# Register fonts for proper display
+# 修复字体注册，避免警告
 try:
-    pdfmetrics.registerFont(TTFont('NotoSans', '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc'))
+    # 尝试多个可能的字体路径
+    font_paths = [
+        '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
+        '/usr/share/fonts/noto/NotoSansCJK-Regular.ttc',
+        '/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc'
+    ]
+    
+    font_registered = False
+    for path in font_paths:
+        if os.path.exists(path):
+            pdfmetrics.registerFont(TTFont('NotoSans', path))
+            font_registered = True
+            break
+            
+    if not font_registered:
+        # 如果找不到NotoSans字体，使用reportlab内置字体，不显示警告
+        logging.info("Using built-in fonts for PDF generation")
 except:
-    # Fallback if font not found
-    logging.warning("NotoSans font not found, using default font")
+    # 出错时静默处理，使用默认字体
+    pass
 
 app = Flask(__name__)
 
@@ -78,38 +94,42 @@ def generate_driver_pdf(driver_id, driver_name, driver_logs, driver_salaries, dr
         bottomMargin=72
     )
     
-    # Styles
+    # 获取样式表但不添加重复样式
     styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(
-        name='Title',
+    
+    # 定义自定义样式，使用不同的名称避免冲突
+    custom_title_style = ParagraphStyle(
+        name='CustomTitle',
         fontName='Helvetica-Bold',
         fontSize=16,
         alignment=1,  # Center
         spaceAfter=12
-    ))
-    styles.add(ParagraphStyle(
-        name='Heading',
+    )
+    
+    custom_heading_style = ParagraphStyle(
+        name='CustomHeading',
         fontName='Helvetica-Bold',
         fontSize=14,
         spaceAfter=6
-    ))
-    styles.add(ParagraphStyle(
-        name='Normal',
+    )
+    
+    custom_normal_style = ParagraphStyle(
+        name='CustomNormal',
         fontName='Helvetica',
         fontSize=10,
         spaceAfter=6
-    ))
+    )
     
     # Content elements
     elements = []
     
     # Title
-    title = Paragraph(f"Driver Report: {driver_name}", styles['Title'])
+    title = Paragraph(f"Driver Report: {driver_name}", custom_title_style)
     elements.append(title)
     elements.append(Spacer(1, 12))
     
     # Clock-in/out Table
-    elements.append(Paragraph("Daily Clock Records", styles['Heading']))
+    elements.append(Paragraph("Daily Clock Records", custom_heading_style))
     elements.append(Spacer(1, 6))
     
     # Prepare clock data
@@ -158,12 +178,12 @@ def generate_driver_pdf(driver_id, driver_name, driver_logs, driver_salaries, dr
         ]))
         elements.append(clock_table)
     else:
-        elements.append(Paragraph("No clock records found.", styles['Normal']))
+        elements.append(Paragraph("No clock records found.", custom_normal_style))
     
     elements.append(Spacer(1, 20))
     
     # Claims Section
-    elements.append(Paragraph("Expense Claims", styles['Heading']))
+    elements.append(Paragraph("Expense Claims", custom_heading_style))
     elements.append(Spacer(1, 6))
     
     # Calculate total claims amount
@@ -206,16 +226,16 @@ def generate_driver_pdf(driver_id, driver_name, driver_logs, driver_salaries, dr
                         elements.append(img)
                         elements.append(Spacer(1, 6))
                 except Exception as e:
-                    elements.append(Paragraph(f"Error loading photo: {str(e)}", styles['Normal']))
+                    elements.append(Paragraph(f"Error loading photo: {str(e)}", custom_normal_style))
             
             elements.append(Spacer(1, 10))
     else:
-        elements.append(Paragraph("No claims found.", styles['Normal']))
+        elements.append(Paragraph("No claims found.", custom_normal_style))
     
     elements.append(Spacer(1, 20))
     
     # Summary Section
-    elements.append(Paragraph("Summary", styles['Heading']))
+    elements.append(Paragraph("Summary", custom_heading_style))
     elements.append(Spacer(1, 6))
     
     # Get balance
