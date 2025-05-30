@@ -10,6 +10,21 @@ import pytz
 import os
 import logging
 import traceback
+import tempfile
+import requests
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+
+# Register fonts for proper display
+try:
+    pdfmetrics.registerFont(TTFont('NotoSans', '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc'))
+except:
+    # Fallback if font not found
+    logging.warning("NotoSans font not found, using default font")
 
 app = Flask(__name__)
 
@@ -38,6 +53,239 @@ tz = pytz.timezone("Asia/Kuala_Lumpur")
 # === conversation 状态 ===
 TOPUP_USER, TOPUP_AMOUNT = range(2)
 CLAIM_TYPE, CLAIM_OTHER_TYPE, CLAIM_AMOUNT, CLAIM_PROOF = range(4)
+
+# === PDF 生成功能 ===
+def download_telegram_photo(file_id, bot):
+    """Download a photo from Telegram by file_id and save to a temporary file"""
+    try:
+        file = bot.get_file(file_id)
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
+        file.download(temp_file.name)
+        return temp_file.name
+    except Exception as e:
+        logger.error(f"Error downloading photo: {str(e)}")
+        return None
+
+def generate_driver_pdf(driver_id, driver_name, driver_logs, driver_salaries, driver_accounts, bot, output_path):
+    """Generate a PDF report for a single driver"""
+    
+    doc = SimpleDocTemplate(
+        output_path,
+        pagesize=A4,
+        rightMargin=72,
+        leftMargin=72,
+        topMargin=72,
+        bottomMargin=72
+    )
+    
+    # Styles
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(
+        name='Title',
+        fontName='Helvetica-Bold',
+        fontSize=16,
+        alignment=1,  # Center
+        spaceAfter=12
+    ))
+    styles.add(ParagraphStyle(
+        name='Heading',
+        fontName='Helvetica-Bold',
+        fontSize=14,
+        spaceAfter=6
+    ))
+    styles.add(ParagraphStyle(
+        name='Normal',
+        fontName='Helvetica',
+        fontSize=10,
+        spaceAfter=6
+    ))
+    
+    # Content elements
+    elements = []
+    
+    # Title
+    title = Paragraph(f"Driver Report: {driver_name}", styles['Title'])
+    elements.append(title)
+    elements.append(Spacer(1, 12))
+    
+    # Clock-in/out Table
+    elements.append(Paragraph("Daily Clock Records", styles['Heading']))
+    elements.append(Spacer(1, 6))
+    
+    # Prepare clock data
+    clock_data = [['Date', 'Clock In', 'Clock Out', 'Hours']]
+    total_hours = 0
+    
+    if driver_id in driver_logs:
+        for date, log in sorted(driver_logs[driver_id].items(), reverse=True):
+            in_time = log.get('in', 'N/A')
+            out_time = log.get('out', 'N/A')
+            
+            # Calculate hours if both in and out times exist
+            hours = 'N/A'
+            if in_time != 'N/A' and out_time != 'N/A' and in_time != 'OFF':
+                try:
+                    # Parse times
+                    in_dt = datetime.datetime.strptime(in_time, "%Y-%m-%d %H:%M:%S")
+                    out_dt = datetime.datetime.strptime(out_time, "%Y-%m-%d %H:%M:%S")
+                    duration = out_dt - in_dt
+                    hours = f"{duration.total_seconds() / 3600:.2f}"
+                except:
+                    hours = 'Error'
+            elif in_time == 'OFF':
+                hours = 'OFF'
+                
+            clock_data.append([date, in_time, out_time, hours])
+    
+    # Get total hours from salary data
+    if driver_id in driver_salaries:
+        total_hours = driver_salaries[driver_id].get('total_hours', 0)
+    
+    # Create clock table
+    if len(clock_data) > 1:
+        clock_table = Table(clock_data, colWidths=[80, 120, 120, 60])
+        clock_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, 0), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 12),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black),
+            ('ALIGN', (0, 1), (-1, -1), 'CENTER'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ]))
+        elements.append(clock_table)
+    else:
+        elements.append(Paragraph("No clock records found.", styles['Normal']))
+    
+    elements.append(Spacer(1, 20))
+    
+    # Claims Section
+    elements.append(Paragraph("Expense Claims", styles['Heading']))
+    elements.append(Spacer(1, 6))
+    
+    # Calculate total claims amount
+    total_claims = 0
+    claims = []
+    
+    if driver_id in driver_accounts:
+        claims = driver_accounts[driver_id].get('claims', [])
+        for claim in claims:
+            total_claims += claim.get('amount', 0)
+    
+    if claims:
+        # Create a table for each claim with its photo
+        for i, claim in enumerate(claims):
+            claim_date = claim.get('date', 'N/A')
+            claim_type = claim.get('type', 'N/A')
+            claim_amount = claim.get('amount', 0)
+            
+            claim_data = [
+                [f"Date: {claim_date}", f"Type: {claim_type}", f"Amount: RM{claim_amount:.2f}"]
+            ]
+            
+            claim_table = Table(claim_data, colWidths=[120, 120, 120])
+            claim_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.lightblue),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black),
+                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+                ('FONTSIZE', (0, 0), (-1, -1), 10),
+            ]))
+            elements.append(claim_table)
+            
+            # Add photo if available
+            if 'photo' in claim and claim['photo']:
+                try:
+                    photo_path = download_telegram_photo(claim['photo'], bot)
+                    if photo_path:
+                        img = Image(photo_path, width=300, height=200)
+                        elements.append(img)
+                        elements.append(Spacer(1, 6))
+                except Exception as e:
+                    elements.append(Paragraph(f"Error loading photo: {str(e)}", styles['Normal']))
+            
+            elements.append(Spacer(1, 10))
+    else:
+        elements.append(Paragraph("No claims found.", styles['Normal']))
+    
+    elements.append(Spacer(1, 20))
+    
+    # Summary Section
+    elements.append(Paragraph("Summary", styles['Heading']))
+    elements.append(Spacer(1, 6))
+    
+    # Get balance
+    balance = 0
+    if driver_id in driver_accounts:
+        balance = driver_accounts[driver_id].get('balance', 0)
+    
+    summary_data = [
+        ['Total Hours', 'Total Claims', 'Account Balance'],
+        [f"{total_hours:.2f} hours", f"RM{total_claims:.2f}", f"RM{balance:.2f}"]
+    ]
+    
+    summary_table = Table(summary_data, colWidths=[120, 120, 120])
+    summary_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.darkblue),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('ALIGN', (0, 0), (-1, 0), 'CENTER'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, 0), 12),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+        ('BACKGROUND', (0, 1), (-1, -1), colors.lightgrey),
+        ('GRID', (0, 0), (-1, -1), 1, colors.black),
+        ('ALIGN', (0, 1), (-1, -1), 'CENTER'),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+        ('FONTSIZE', (0, 1), (-1, -1), 10),
+    ]))
+    elements.append(summary_table)
+    
+    # Build the PDF
+    doc.build(elements)
+    
+    return output_path
+
+def generate_all_drivers_pdf(driver_logs, driver_salaries, driver_accounts, bot, output_dir):
+    """Generate PDF reports for all drivers and return a list of file paths"""
+    
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    pdf_files = []
+    
+    # Process each driver
+    for driver_id in driver_accounts.keys():
+        try:
+            # Get driver name
+            try:
+                chat = bot.get_chat(driver_id)
+                driver_name = f"@{chat.username}" if chat.username else chat.first_name
+            except:
+                driver_name = f"Driver {driver_id}"
+            
+            # Generate PDF
+            output_path = os.path.join(output_dir, f"driver_{driver_id}.pdf")
+            generate_driver_pdf(
+                driver_id, 
+                driver_name, 
+                driver_logs, 
+                driver_salaries, 
+                driver_accounts, 
+                bot, 
+                output_path
+            )
+            
+            pdf_files.append(output_path)
+            
+        except Exception as e:
+            logger.error(f"Error generating PDF for driver {driver_id}: {str(e)}")
+    
+    return pdf_files
 
 # === 错误处理函数 ===
 def error_handler(update, context):
@@ -245,6 +493,53 @@ def viewclaims(update, context):
 
     update.message.reply_text(msg)
 
+# === /PDF (管理员) ===
+def generate_pdf(update, context):
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        return update.message.reply_text("❌ You are not an admin.")
+    
+    logger.info(f"Admin {user_id} requested PDF generation")
+    
+    update.message.reply_text("🔄 Generating PDF reports for all drivers. This may take a moment...")
+    
+    try:
+        # Create temp directory for PDFs
+        temp_dir = tempfile.mkdtemp()
+        
+        # Generate PDFs
+        pdf_files = generate_all_drivers_pdf(
+            driver_logs, 
+            driver_salaries, 
+            driver_accounts, 
+            bot, 
+            temp_dir
+        )
+        
+        if not pdf_files:
+            update.message.reply_text("❌ No driver data available to generate PDFs.")
+            return
+        
+        # Send each PDF
+        for pdf_file in pdf_files:
+            try:
+                with open(pdf_file, 'rb') as f:
+                    update.message.reply_document(
+                        document=f,
+                        filename=os.path.basename(pdf_file),
+                        caption="Driver Report"
+                    )
+            except Exception as e:
+                logger.error(f"Error sending PDF: {str(e)}")
+                update.message.reply_text(f"❌ Error sending PDF: {str(e)}")
+        
+        update.message.reply_text(f"✅ Generated {len(pdf_files)} PDF reports.")
+        
+    except Exception as e:
+        logger.error(f"PDF generation error: {str(e)}")
+        logger.exception(e)
+        update.message.reply_text(f"❌ Error generating PDFs: {str(e)}")
+
 # === /topup (交互流程管理员专用) ===
 def topup_start(update, context):
     user_id = update.effective_user.id
@@ -434,6 +729,7 @@ dispatcher.add_handler(CommandHandler("offday", offday))
 dispatcher.add_handler(CommandHandler("balance", balance))
 dispatcher.add_handler(CommandHandler("check", check))
 dispatcher.add_handler(CommandHandler("viewclaims", viewclaims))
+dispatcher.add_handler(CommandHandler("PDF", generate_pdf))
 
 # === topup handler ===
 dispatcher.add_handler(ConversationHandler(
