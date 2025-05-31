@@ -1,24 +1,30 @@
 """
-MongoDB数据库连接和操作模块 (修复警告版)
+MongoDB数据库连接和操作模块 (简化版)
 """
 
 from pymongo import MongoClient
 import os
 import logging
+import ssl
 
 # 设置日志
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# 禁用SSL证书验证
+ssl._create_default_https_context = ssl._create_unverified_context
+
 # 从环境变量获取MongoDB连接字符串
-MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://yesclub0802:OWMjMxjzMPHGfPoA@cluster0.fy6uhn1.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0&tlsAllowInvalidCertificates=true")
+MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://yesclub0802:OWMjMxjzMPHGfPoA@cluster0.fy6uhn1.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0" )
 DB_NAME = "clock_bot_db"
 
 # 创建MongoDB客户端连接
 try:
-    # 连接到MongoDB Atlas，使用连接字符串中的参数
+    # 连接到MongoDB Atlas，添加SSL配置
     client = MongoClient(
         MONGO_URI,
+        ssl=True,
+        ssl_cert_reqs=ssl.CERT_NONE,
         connectTimeoutMS=30000,
         socketTimeoutMS=30000,
         serverSelectionTimeoutMS=30000
