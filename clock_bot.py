@@ -1152,12 +1152,12 @@ def cancel(update, context):
     
     return ConversationHandler.END
 
-# === Webhook ===
-@app.route(f"/{TOKEN}", methods=["POST"])
+@app.route("/webhook", methods=["POST"])
 def webhook():
     update = Update.de_json(request.get_json(force=True), bot)
     dispatcher.process_update(update)
-    return "ok"
+    return "ok", 200
+
 
 # === Dispatcher 注册 ===
 dispatcher.add_handler(CommandHandler("start", start))
