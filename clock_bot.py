@@ -20,20 +20,6 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
-# ✅ 引入 pymongo，用于连接 MongoDB Atlas
-from pymongo import MongoClient
-
-# 在 clock_bot.py 中修改连接代码
-mongo_uri = os.environ.get("MONGO_URI", "")
-if not mongo_uri.startswith("mongodb"):
-    mongo_uri = "mongodb+srv://fiofai:kienfeilowfio@cluster0.fy6uhn1.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
-client = MongoClient(mongo_uri)
-
-
-# ✅ 定义数据库和集合
-db = client["clockin_bot"]
-drivers_collection = db["drivers"]
-
 # 修复字体注册，避免警告
 try:
     # 尝试多个可能的字体路径
@@ -1152,14 +1138,12 @@ def cancel(update, context):
     
     return ConversationHandler.END
 
-@app.route("/webhook", methods=["POST"])
+# === Webhook ===
+@app.route(f"/{TOKEN}", methods=["POST"])
 def webhook():
-    print("🔥 收到 Telegram webhook 请求")
     update = Update.de_json(request.get_json(force=True), bot)
     dispatcher.process_update(update)
-    return "ok", 200
-
-
+    return "ok"
 
 # === Dispatcher 注册 ===
 dispatcher.add_handler(CommandHandler("start", start))
@@ -1211,20 +1195,3 @@ dispatcher.add_error_handler(error_handler)
 if __name__ == "__main__":
     logger.info("Bot server started.")
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-
-
-# === PingDB 测试命令，用于测试 MongoDB 写入是否成功 ===
-def pingdb(update, context):
-    try:
-        test_data = {
-            "test": True,
-            "username": update.effective_user.username or "unknown",
-            "timestamp": datetime.datetime.now(tz)
-        }
-        db.test_collection.insert_one(test_data)
-        update.message.reply_text("✅ MongoDB insert success!")
-    except Exception as e:
-        update.message.reply_text(f"❌ MongoDB error: {str(e)}")
-
-# === 注册 /pingdb 指令 ===
-dispatcher.add_handler(CommandHandler("pingdb", pingdb))
