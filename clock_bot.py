@@ -20,6 +20,19 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
+# ✅ 引入 pymongo，用于连接 MongoDB Atlas
+from pymongo import MongoClient
+
+# ✅ 配置 MongoDB Atlas 连接（适配 Render 平台 tlsAllowInvalidCertificates=True）
+client = MongoClient(
+    "mongodb+srv://fiofai:kienfeilowfio@cluster0.fy6uhn1.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0",
+    tlsAllowInvalidCertificates=True
+)
+
+# ✅ 定义数据库和集合
+db = client["clockin_bot"]
+drivers_collection = db["drivers"]
+
 # 修复字体注册，避免警告
 try:
     # 尝试多个可能的字体路径
