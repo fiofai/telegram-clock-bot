@@ -23,8 +23,12 @@ from reportlab.pdfbase.ttfonts import TTFont
 # ✅ 引入 pymongo，用于连接 MongoDB Atlas
 from pymongo import MongoClient
 
-# ✅ Railway 安全连接 MongoDB Atlas（从环境变量获取）
-client = MongoClient(os.environ.get("MONGO_URI"))
+# 在 clock_bot.py 中修改连接代码
+mongo_uri = os.environ.get("MONGO_URI", "")
+if not mongo_uri.startswith("mongodb"):
+    mongo_uri = "mongodb+srv://fiofai:kienfeilowfio@cluster0.fy6uhn1.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+client = MongoClient(mongo_uri)
+
 
 # ✅ 定义数据库和集合
 db = client["clockin_bot"]
