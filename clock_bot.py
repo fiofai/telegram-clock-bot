@@ -5,7 +5,6 @@ from telegram import (
 from telegram.ext import (
     Dispatcher, CommandHandler, MessageHandler, Filters, ConversationHandler, CallbackQueryHandler
 )
-import db_mongo
 import datetime
 import pytz
 import os
