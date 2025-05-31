@@ -1,10 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Telegram Bot for Driver Clock-in/out, Claims, and Balance Management
-
-This version integrates MongoDB for data persistence.
-"""
-
 from flask import Flask, request
 from telegram import (
     Bot, Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
@@ -12,6 +5,7 @@ from telegram import (
 from telegram.ext import (
     Dispatcher, CommandHandler, MessageHandler, Filters, ConversationHandler, CallbackQueryHandler
 )
+import db_mongo
 import datetime
 import pytz
 import os
@@ -20,16 +14,12 @@ import traceback
 import tempfile
 import requests
 import calendar
-import json
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-
-# 导入MongoDB数据库操作模块
-import db_mongo
 
 # 修复字体注册，避免警告
 try:
@@ -56,22 +46,14 @@ except:
 
 app = Flask(__name__)
 
-# 从环境变量获取Telegram Bot Token
 TOKEN = os.environ.get("TOKEN")
-# 管理员用户ID列表
 ADMIN_IDS = [1165249082]
-# 默认时薪，RM20/小时
-DEFAULT_HOURLY_RATE = 20.00
-# 默认月薪，RM3500
-DEFAULT_MONTHLY_SALARY = 3500.00
-# 默认每月工作天数
-WORKING_DAYS_PER_MONTH = 22
-# 默认每天工作小时数
-WORKING_HOURS_PER_DAY = 8
+DEFAULT_HOURLY_RATE = 20.00  # 默认时薪，RM20/小时
+DEFAULT_MONTHLY_SALARY = 3500.00  # 默认月薪，RM3500
+WORKING_DAYS_PER_MONTH = 22  # 默认每月工作天数
+WORKING_HOURS_PER_DAY = 8  # 默认每天工作小时数
 
-# 初始化Telegram Bot
 bot = Bot(token=TOKEN)
-# 初始化Dispatcher
 dispatcher = Dispatcher(bot, None, use_context=True)
 
 # === 日志设置 ===
@@ -81,40 +63,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# === 全局数据结构 (现在从数据库加载) ===
+# === 全局数据结构 ===
 driver_logs = {}
 driver_salaries = {}
 driver_accounts = {}
-
-# === 状态变量 (用于会话处理) ===
 topup_state = {}
 claim_state = {}
 pdf_state = {}  # 用于存储PDF生成状态
 salary_state = {}  # 新增：用于存储薪资设置状态
 
-# 设置时区为亚洲/吉隆坡
 tz = pytz.timezone("Asia/Kuala_Lumpur")
 
-# === Conversation 状态定义 ===
+# === conversation 状态 ===
 TOPUP_USER, TOPUP_AMOUNT = range(2)
 CLAIM_TYPE, CLAIM_OTHER_TYPE, CLAIM_AMOUNT, CLAIM_PROOF = range(4)
 PDF_SELECT_DRIVER = range(1)  # PDF司机选择状态
 SALARY_SELECT_DRIVER, SALARY_ENTER_AMOUNT = range(2)  # 新增：薪资设置状态
-
-# === 从数据库加载数据 ===
-try:
-    # 尝试从MongoDB加载所有数据
-    driver_logs = db_mongo.get_driver_logs()
-    driver_salaries = db_mongo.get_driver_salaries()
-    driver_accounts = db_mongo.get_driver_accounts()
-    logger.info("从MongoDB数据库加载数据成功")
-except Exception as e:
-    # 如果加载失败，记录错误并使用空字典
-    logger.error(f"从MongoDB数据库加载数据失败: {str(e)}")
-    # 保持默认的空字典
-    driver_logs = {}
-    driver_salaries = {}
-    driver_accounts = {}
 
 # === 辅助函数 ===
 def format_local_time(timestamp_str):
@@ -345,8 +309,6 @@ def generate_driver_pdf(driver_id, driver_name, driver_logs, driver_salaries, dr
                         img = Image(photo_path, width=300, height=200)
                         elements.append(img)
                         elements.append(Spacer(1, 6))
-                        # Clean up temporary photo file
-                        os.unlink(photo_path)
                 except Exception as e:
                     elements.append(Paragraph(f"Error loading photo: {str(e)}", custom_normal_style))
             
@@ -519,443 +481,524 @@ def generate_single_driver_pdf(driver_id, driver_logs, driver_salaries, driver_a
         )
         
         return output_path
-        
     except Exception as e:
         logger.error(f"Error generating PDF for driver {driver_id}: {str(e)}")
         return None
 
-# === Telegram 命令处理函数 ===
+# === 错误处理函数 ===
+def error_handler(update, context):
+    """处理所有未捕获的异常"""
+    logger.error("Exception while handling an update:", exc_info=context.error)
+    
+    # 尝试发送错误消息给用户
+    try:
+        if update and update.effective_message:
+            update.effective_message.reply_text(
+                "⚠️ An unexpected error occurred. Please try again later."
+            )
+    except:
+        logger.error("Failed to send error message to user")
+    
+    # 记录完整的错误信息
+    tb_list = traceback.format_exception(None, context.error, context.error.__traceback__)
+    tb_string = ''.join(tb_list)
+    logger.error(f"Full traceback:\n{tb_string}")
+
+# === /start ===
 def start(update, context):
-    """处理 /start 命令"""
-    user_id = update.effective_user.id
-    username = update.effective_user.username or str(user_id)
-    logger.info(f"User {username} started the bot")
-    
-    # 检查是否是管理员
+    user = update.effective_user
+    user_id = user.id
+    username = user.username or str(user_id)
+
+    driver_logs.setdefault(user_id, {})
+    driver_salaries.setdefault(user_id, {"total_hours": 0.0, "daily_log": {}})
+    driver_accounts.setdefault(user_id, {"balance": 0.0, "claims": [], "topup_history": []})
+
+    msg = (
+        f"👋 Hello {user.first_name}!\n"
+        "Welcome to Driver ClockIn Bot.\n\n"
+        "Available Commands:\n"
+        "🕑 /clockin\n"
+        "🏁 /clockout\n"
+        "📅 /offday\n"
+        "💸 /claim"
+    )
     if user_id in ADMIN_IDS:
-        update.message.reply_text(
-            "Welcome Admin! Available commands:\n" 
-            "/topup - Top up driver account\n" 
-            "/PDF - Generate PDF reports\n" 
-            "/salary - Set driver monthly salary\n" 
-            "/migrate - Migrate data to DB (run once)\n" 
-            "/export - Export data as JSON"
-        )
-    else:
-        update.message.reply_text(
-            "Welcome! Available commands:\n" 
-            "/clockin - Clock in\n" 
-            "/clockout - Clock out\n" 
-            "/offday - Mark today as day off\n" 
-            "/balance - Check account balance\n" 
-            "/check - Check clock-in records\n" 
-            "/claim - Submit expense claim\n" 
-            "/viewclaims - View claim history"
+        msg += (
+            "\n\n🔐 Admin Commands:\n"
+            "📊 /balance\n"
+            "📄 /check\n"
+            "🧾 /PDF\n"
+            "💵 /topup\n"
+            "📷 /viewclaims\n"
+            "💰 /salary"  # 新增薪资设置命令
         )
 
+    update.message.reply_text(msg)
+    logger.info(f"User {username} started the bot")
+
+# === /clockin ===
 def clockin(update, context):
-    """处理 /clockin 命令"""
     user_id = update.effective_user.id
     username = update.effective_user.username or str(user_id)
-    today = datetime.datetime.now(tz).strftime("%Y-%m-%d")
-    now = datetime.datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
-    
-    # 初始化用户记录
-    if user_id not in driver_logs:
-        driver_logs[user_id] = {}
-    
-    # 检查今天是否已经打卡
-    if today in driver_logs[user_id] and driver_logs[user_id][today].get('in') not in ['N/A', 'OFF']:
-        update.message.reply_text(f"⚠️ 您今天已经打卡了: {driver_logs[user_id][today]['in']}")
-        return
-    
-    # 记录打卡时间
-    driver_logs[user_id][today] = {'in': now, 'out': 'N/A'}
-    
-    # 保存到数据库 - 新增代码
-    try:
-        db_mongo.save_driver_logs(driver_logs)
-        logger.info(f"用户 {username} 的打卡记录已保存到数据库")
-    except Exception as e:
-        logger.error(f"保存打卡记录到数据库失败: {str(e)}")
-    
-    update.message.reply_text(f"✅ 打卡成功: {now}")
-    logger.info(f"User {username} clocked in at {now}")
+    now = datetime.datetime.now(tz)
+    today = now.strftime("%Y-%m-%d")
+    clock_time = now.strftime("%Y-%m-%d %H:%M:%S")
 
+    driver_logs.setdefault(user_id, {}).setdefault(today, {})['in'] = clock_time
+    
+    # 修复：使用format_local_time确保显示本地时间格式
+    local_time = format_local_time(clock_time)
+    update.message.reply_text(f"✅ Clocked in at {local_time}")
+    
+    logger.info(f"User {username} clocked in at {clock_time}")
+
+# === /clockout ===
 def clockout(update, context):
-    """处理 /clockout 命令"""
     user_id = update.effective_user.id
     username = update.effective_user.username or str(user_id)
-    today = datetime.datetime.now(tz).strftime("%Y-%m-%d")
-    now = datetime.datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
-    
-    # 检查是否有打卡记录
-    if user_id not in driver_logs or today not in driver_logs[user_id]:
-        update.message.reply_text("⚠️ 您今天还没有打卡")
-        return
-    
-    # 检查是否已经下班打卡
-    if driver_logs[user_id][today].get('out') not in ['N/A', 'OFF']:
-        update.message.reply_text(f"⚠️ 您今天已经下班打卡了: {driver_logs[user_id][today]['out']}")
-        return
-    
-    # 检查是否是休息日
-    if driver_logs[user_id][today].get('in') == 'OFF':
-        update.message.reply_text("⚠️ 今天是您的休息日")
-        return
-    
-    # 记录下班时间
-    driver_logs[user_id][today]['out'] = now
-    
-    # 计算工作时长
-    try:
-        in_time = datetime.datetime.strptime(driver_logs[user_id][today]['in'], "%Y-%m-%d %H:%M:%S")
-        out_time = datetime.datetime.strptime(now, "%Y-%m-%d %H:%M:%S")
-        duration = out_time - in_time
-        hours = duration.total_seconds() / 3600
-        
-        # 更新总工作时长
-        driver_salaries.setdefault(user_id, {"monthly_salary": DEFAULT_MONTHLY_SALARY, "total_hours": 0})
-        driver_salaries[user_id]["total_hours"] += hours
-        driver_salaries[user_id]["last_updated"] = now
-        
-        # 保存到数据库 - 新增代码
-        try:
-            db_mongo.save_driver_logs(driver_logs)
-            db_mongo.save_driver_salaries(driver_salaries)
-            logger.info(f"用户 {username} 的打卡和薪资记录已保存到数据库")
-        except Exception as e:
-            logger.error(f"保存记录到数据库失败: {str(e)}")
-        
-        # 格式化时长显示
-        hours_str = format_duration(hours)
-        update.message.reply_text(f"✅ 下班打卡成功: {now}\n⏱ 今日工作时长: {hours_str}")
-    except Exception as e:
-        logger.error(f"计算工作时长错误: {str(e)}")
-        update.message.reply_text(f"✅ 下班打卡成功: {now}")
-    
-    logger.info(f"User {username} clocked out at {now}")
+    now = datetime.datetime.now(tz)
+    today = now.strftime("%Y-%m-%d")
+    clock_time = now.strftime("%Y-%m-%d %H:%M:%S")
 
+    # 检查是否已打卡
+    if user_id not in driver_logs or today not in driver_logs[user_id] or 'in' not in driver_logs[user_id][today]:
+        error_msg = "❌ You haven't clocked in today."
+        logger.warning(error_msg)
+        update.message.reply_text(error_msg)
+        return
+
+    try:
+        # 保存打卡时间
+        driver_logs[user_id][today]['out'] = clock_time
+        
+        # 获取打卡时间并解析
+        in_time_str = driver_logs[user_id][today]['in']
+        
+        # 解析时间字符串为无时区对象
+        naive_in_time = datetime.datetime.strptime(in_time_str, "%Y-%m-%d %H:%M:%S")
+        
+        # 将当前时间转换为无时区对象（同一时区）
+        now_naive = now.replace(tzinfo=None)
+        
+        # 计算时间差
+        duration = now_naive - naive_in_time
+        total_seconds = duration.total_seconds()
+        
+        # 确保时间差为正数
+        if total_seconds < 0:
+            logger.warning(f"Negative time difference detected: {total_seconds} seconds")
+            total_seconds = abs(total_seconds)
+        
+        # 计算小时和分钟
+        hours = int(total_seconds // 3600)
+        minutes = int((total_seconds % 3600) // 60)
+        
+        # 格式化时间字符串
+        if hours and minutes:
+            time_str = f"{hours}Hour {minutes}Min"
+        elif hours:
+            time_str = f"{hours}Hour"
+        else:
+            time_str = f"{minutes}Min"
+
+        # 确保薪资记录存在
+        if user_id not in driver_salaries:
+            driver_salaries[user_id] = {'total_hours': 0.0, 'daily_log': {}}
+        
+        # 更新工时
+        hours_worked = total_seconds / 3600
+        driver_salaries[user_id]['total_hours'] += hours_worked
+        driver_salaries[user_id]['daily_log'][today] = hours_worked
+
+        # 修复：使用format_local_time确保显示本地时间格式
+        local_time = format_local_time(clock_time)
+        update.message.reply_text(f"🏁 Clocked out at {local_time}. Worked {time_str}.")
+        
+        logger.info(f"User {username} clocked out: worked {time_str}")
+    except Exception as e:
+        # 记录错误日志
+        logger.error(f"Clockout error for user {username}: {str(e)}")
+        logger.exception(e)
+        
+        # 发送错误消息
+        update.message.reply_text("⚠️ An error occurred during clockout. Please try again.")
+
+# === /offday ===
 def offday(update, context):
-    """处理 /offday 命令"""
     user_id = update.effective_user.id
     username = update.effective_user.username or str(user_id)
     today = datetime.datetime.now(tz).strftime("%Y-%m-%d")
-    
-    # 初始化用户记录
-    if user_id not in driver_logs:
-        driver_logs[user_id] = {}
-    
-    # 检查今天是否已经有记录
-    if today in driver_logs[user_id] and driver_logs[user_id][today].get('in') not in ['N/A', 'OFF']:
-        update.message.reply_text(f"⚠️ 您今天已经打卡了: {driver_logs[user_id][today]['in']}")
-        return
-    
-    # 标记为休息日
-    driver_logs[user_id][today] = {'in': 'OFF', 'out': 'OFF'}
-    
-    # 保存到数据库 - 新增代码
-    try:
-        db_mongo.save_driver_logs(driver_logs)
-        logger.info(f"用户 {username} 的休息日记录已保存到数据库")
-    except Exception as e:
-        logger.error(f"保存休息日记录到数据库失败: {str(e)}")
-    
-    update.message.reply_text(f"✅ 已标记 {today} 为休息日")
-    logger.info(f"User {username} marked {today} as day off")
+    driver_logs.setdefault(user_id, {})[today] = {"in": "OFF", "out": "OFF"}
+    update.message.reply_text(f"📅 Marked {today} as off day.")
+    logger.info(f"User {username} marked {today} as off day")
 
+# === /balance（管理员）===
 def balance(update, context):
-    """处理 /balance 命令"""
     user_id = update.effective_user.id
-    username = update.effective_user.username or str(user_id)
-    
-    if user_id in driver_accounts:
-        balance = driver_accounts[user_id].get("balance", 0.0)
-        update.message.reply_text(f"💰 Your current balance: RM{balance:.2f}")
-    else:
-        update.message.reply_text("💰 Your current balance: RM0.00")
-    
-    logger.info(f"User {username} checked balance")
-
-def check(update, context):
-    """处理 /check 命令"""
-    user_id = update.effective_user.id
-    username = update.effective_user.username or str(user_id)
-    
-    if user_id not in driver_logs:
-        update.message.reply_text("📅 No clock-in records found.")
+    if user_id not in ADMIN_IDS:
         return
     
-    response = "📅 Your recent clock-in records:\n"
-    # 只显示最近7天的记录
-    count = 0
-    for date, log in sorted(driver_logs[user_id].items(), reverse=True):
-        if count >= 7:
-            break
-        in_time = log.get("in", "N/A")
-        out_time = log.get("out", "N/A")
-        
-        # 格式化时间
-        if in_time != 'N/A' and in_time != 'OFF':
+    logger.info(f"Admin {user_id} requested balance")
+    
+    msg = "📊 Driver Balances:\n"
+    for uid, acc in driver_accounts.items():
+        try:
+            chat = bot.get_chat(uid)
+            name = f"@{chat.username}" if chat.username else chat.first_name
+            msg += f"• {name}: RM{acc['balance']:.2f}\n"
+        except Exception as e:
+            logger.error(f"Error getting chat for user {uid}: {str(e)}")
+            msg += f"• User {uid}: RM{acc['balance']:.2f}\n"
+    
+    update.message.reply_text(msg)
+
+# === /check（管理员）===
+def check(update, context):
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        return
+    
+    logger.info(f"Admin {user_id} requested check")
+    
+    today = datetime.datetime.now(tz).strftime("%Y-%m-%d")
+    msg = "📄 Today's Status:\n"
+    for uid, log in driver_logs.items():
+        day = log.get(today, {})
+        in_time = day.get("in", "❌")
+        if in_time != "❌" and in_time != "OFF":
             in_time = format_local_time(in_time)
-        if out_time != 'N/A' and out_time != 'OFF':
+            
+        out_time = day.get("out", "❌")
+        if out_time != "❌" and out_time != "OFF":
             out_time = format_local_time(out_time)
             
-        response += f"\n*{date}*\n  In: {in_time}\n  Out: {out_time}\n"
-        count += 1
-        
-    update.message.reply_text(response, parse_mode="Markdown")
-    logger.info(f"User {username} checked clock-in records")
+        try:
+            chat = bot.get_chat(uid)
+            name = f"@{chat.username}" if chat.username else chat.first_name
+        except Exception as e:
+            logger.error(f"Error getting chat for user {uid}: {str(e)}")
+            name = f"User {uid}"
+        msg += f"• {name}: IN: {in_time}, OUT: {out_time}\n"
+    update.message.reply_text(msg)
 
+# === /viewclaims（管理员）===
 def viewclaims(update, context):
-    """处理 /viewclaims 命令"""
-    user_id = update.effective_user.id
-    username = update.effective_user.username or str(user_id)
-    
-    if user_id not in driver_accounts or not driver_accounts[user_id].get("claims"):
-        update.message.reply_text("🧾 No claims found.")
-        return
-    
-    response = "🧾 Your recent claims:\n"
-    claims = driver_accounts[user_id]["claims"]
-    # 只显示最近5条记录
-    for claim in sorted(claims, key=lambda x: x.get('date', ''), reverse=True)[:5]:
-        date = claim.get("date", "N/A")
-        type = claim.get("type", "N/A")
-        amount = claim.get("amount", 0)
-        response += f"\n*{date}* - {type}: RM{amount:.2f}\n"
-        
-    update.message.reply_text(response, parse_mode="Markdown")
-    logger.info(f"User {username} viewed claims")
-
-# === PDF 生成命令 ===
-def pdf_start(update, context):
-    """处理 /PDF 命令，开始PDF生成流程"""
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
-        update.message.reply_text("⛔ You do not have permission for this command.")
-        return ConversationHandler.END
+        return update.message.reply_text("❌ You are not an admin.")
     
-    # 获取所有有账户记录的司机
-    drivers = []
-    for driver_id in driver_accounts.keys():
+    msg = "📷 Claim Summary:\n"
+    for uid, account in driver_accounts.items():
+        claims = account.get("claims", [])
+        if not claims:
+            continue
         try:
-            chat = bot.get_chat(driver_id)
+            chat = bot.get_chat(uid)
             name = f"@{chat.username}" if chat.username else chat.first_name
-            drivers.append((driver_id, name))
         except:
-            drivers.append((driver_id, f"User {driver_id}"))
-    
-    if not drivers:
-        update.message.reply_text("❌ No driver data found to generate PDF.")
-        return ConversationHandler.END
-    
-    # 创建按钮
-    keyboard = [[InlineKeyboardButton("All Drivers", callback_data="pdf_all")]]
-    for driver_id, name in drivers:
-        keyboard.append([InlineKeyboardButton(name, callback_data=f"pdf_{driver_id}")])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    update.message.reply_text("📄 Select driver(s) to generate PDF report:", reply_markup=reply_markup)
-    
-    return PDF_SELECT_DRIVER
-
-def pdf_button_callback(update, context):
-    """处理PDF选择按钮的回调"""
-    query = update.callback_query
-    query.answer()
-    
-    data = query.data
-    admin_id = query.from_user.id
-    
-    query.edit_message_text(text="⏳ Generating PDF report(s)... Please wait.")
-    
-    temp_dir = tempfile.mkdtemp()
-    pdf_files = []
-    
-    try:
-        if data == "pdf_all":
-            pdf_files = generate_all_drivers_pdf(
-                driver_logs, driver_salaries, driver_accounts, bot, temp_dir
-            )
-        elif data.startswith("pdf_"):
-            driver_id = int(data.split("_")[1])
-            pdf_path = generate_single_driver_pdf(
-                driver_id, driver_logs, driver_salaries, driver_accounts, bot, temp_dir
-            )
-            if pdf_path:
-                pdf_files.append(pdf_path)
+            name = str(uid)
         
-        if pdf_files:
-            query.edit_message_text(text="📤 Sending PDF report(s)...")
-            for pdf_file in pdf_files:
-                try:
-                    context.bot.send_document(chat_id=admin_id, document=open(pdf_file, 'rb'))
-                except Exception as send_err:
-                    logger.error(f"Error sending PDF {pdf_file}: {str(send_err)}")
-                    query.message.reply_text(f"❌ Error sending PDF for {os.path.basename(pdf_file)}.")
-                finally:
-                    # Clean up individual PDF file
-                    if os.path.exists(pdf_file):
-                        os.unlink(pdf_file)
-            query.edit_message_text(text="✅ PDF report(s) sent successfully.")
-        else:
-            query.edit_message_text(text="❌ Failed to generate PDF report(s).")
-            
-    except Exception as e:
-        logger.error(f"PDF generation error: {str(e)}")
-        query.edit_message_text(text="❌ An error occurred during PDF generation.")
-    finally:
-        # Clean up temporary directory
-        if os.path.exists(temp_dir):
-            import shutil
-            shutil.rmtree(temp_dir)
-            
-    return ConversationHandler.END
+        msg += f"\n🧾 {name}'s Claims:\n"
+        for c in claims[-5:]:  # 显示最多 5 条
+            msg += f"• {c['date']} - RM{c['amount']} ({c['type']})\n"
 
-# === /salary 命令处理函数 (新增) ===
+    update.message.reply_text(msg)
+
+# === /salary (管理员) - 新增薪资设置功能 ===
 def salary_start(update, context):
-    """开始设置司机月薪的流程"""
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
-        update.message.reply_text("⛔ You do not have permission for this command.")
-        return ConversationHandler.END
+        return update.message.reply_text("❌ You are not an admin.")
     
-    # 获取所有司机列表
-    drivers = []
-    for driver_id in driver_accounts.keys():
+    logger.info(f"Admin {user_id} started salary setting process")
+    
+    keyboard = []
+    salary_state[user_id] = {}
+    
+    # 添加司机选项
+    for uid in driver_accounts.keys():
         try:
-            chat = bot.get_chat(driver_id)
+            chat = bot.get_chat(uid)
             name = f"@{chat.username}" if chat.username else chat.first_name
-            drivers.append(f"{name} ({driver_id})")
-        except:
-            drivers.append(f"User {driver_id}")
-            
-    if not drivers:
+            keyboard.append([name])
+            salary_state[user_id][name] = uid
+        except Exception as e:
+            logger.error(f"Error getting chat for user {uid}: {str(e)}")
+            name = f"User {uid}"
+            keyboard.append([name])
+            salary_state[user_id][name] = uid
+
+    if not keyboard:
         update.message.reply_text("❌ No drivers found.")
         return ConversationHandler.END
-        
-    # 发送司机列表供选择
-    keyboard = [[driver] for driver in drivers]
+
     update.message.reply_text(
-        "💼 Select the driver to set monthly salary:",
+        "👤 Select driver to set salary:",
         reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True)
     )
     return SALARY_SELECT_DRIVER
 
 def salary_select_driver(update, context):
-    """处理管理员选择的司机"""
     admin_id = update.effective_user.id
-    selected_text = update.message.text
+    selected = update.message.text.strip()
     
-    try:
-        # 从文本中提取司机ID
-        driver_id = int(selected_text.split('(')[-1].split(')')[0])
-        context.user_data["salary_driver_id"] = driver_id
-        
-        # 获取当前月薪
-        current_salary = DEFAULT_MONTHLY_SALARY
-        if driver_id in driver_salaries:
-            current_salary = driver_salaries[driver_id].get("monthly_salary", DEFAULT_MONTHLY_SALARY)
-            
-        update.message.reply_text(f"💰 Enter the new monthly salary for this driver (Current: RM{current_salary:.2f}):")
-        return SALARY_ENTER_AMOUNT
-    except:
-        update.message.reply_text("❌ Invalid selection. Please select a driver from the list.")
-        return SALARY_SELECT_DRIVER
+    logger.info(f"Admin {admin_id} selected driver: {selected}")
+
+    if admin_id not in salary_state or selected not in salary_state[admin_id]:
+        update.message.reply_text("❌ Invalid selection.")
+        return ConversationHandler.END
+
+    driver_id = salary_state[admin_id][selected]
+    context.user_data["salary_driver_id"] = driver_id
+    context.user_data["salary_driver_name"] = selected
+    
+    # 获取当前薪资（如果有）
+    current_salary = "not set"
+    if driver_id in driver_salaries and "monthly_salary" in driver_salaries[driver_id]:
+        current_salary = f"RM{driver_salaries[driver_id]['monthly_salary']:.2f}"
+    
+    update.message.reply_text(
+        f"💰 Enter monthly salary for {selected}:\n"
+        f"Current salary: {current_salary}",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    return SALARY_ENTER_AMOUNT
 
 def salary_enter_amount(update, context):
-    """处理管理员输入的月薪金额"""
     admin_id = update.effective_user.id
     try:
-        new_salary = float(update.message.text.strip())
+        monthly_salary = float(update.message.text.strip())
         driver_id = context.user_data.get("salary_driver_id")
+        driver_name = context.user_data.get("salary_driver_name")
         
         if not driver_id:
             update.message.reply_text("❌ Error: No driver selected.")
             return ConversationHandler.END
             
-        # 更新或创建司机薪资记录
-        driver_salaries.setdefault(driver_id, {"total_hours": 0})
-        driver_salaries[driver_id]["monthly_salary"] = new_salary
-        driver_salaries[driver_id]["last_updated"] = datetime.datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+        # 确保司机薪资记录存在
+        driver_salaries.setdefault(driver_id, {
+            "total_hours": 0.0, 
+            "daily_log": {}
+        })
         
-        # 保存到数据库 - 新增代码
-        try:
-            db_mongo.save_driver_salaries(driver_salaries)
-            logger.info(f"管理员 {admin_id} 为用户 {driver_id} 设置月薪为 {new_salary} 的记录已保存到数据库")
-        except Exception as e:
-            logger.error(f"保存薪资记录到数据库失败: {str(e)}")
+        # 设置月薪
+        driver_salaries[driver_id]["monthly_salary"] = monthly_salary
         
-        try:
-            chat = bot.get_chat(driver_id)
-            name = f"@{chat.username}" if chat.username else chat.first_name
-        except:
-            name = f"User {driver_id}"
-            
-        update.message.reply_text(f"✅ Monthly salary for {name} set to RM{new_salary:.2f}.")
-        logger.info(f"Admin {admin_id} set monthly salary for {name} to RM{new_salary:.2f}")
+        # 计算时薪
+        hourly_rate = calculate_hourly_rate(monthly_salary)
         
+        update.message.reply_text(
+            f"✅ Set monthly salary for {driver_name}:\n"
+            f"Monthly: RM{monthly_salary:.2f}\n"
+            f"Hourly: RM{hourly_rate:.2f}\n"
+            f"(Based on {WORKING_DAYS_PER_MONTH} days/month, {WORKING_HOURS_PER_DAY} hours/day)"
+        )
+        
+        logger.info(f"Admin {admin_id} set salary for {driver_name}: RM{monthly_salary:.2f}/month")
     except ValueError:
         update.message.reply_text("❌ Invalid amount. Please enter a number.")
         return SALARY_ENTER_AMOUNT
     except Exception as e:
         logger.error(f"Salary setting error: {str(e)}")
         update.message.reply_text("❌ An error occurred during salary setting.")
-        
-    # 清理状态
-    if "salary_driver_id" in context.user_data:
-        del context.user_data["salary_driver_id"]
-        
+    
     return ConversationHandler.END
 
-# === /topup 分阶段 ===
-def topup_start(update, context):
-    """处理 /topup 命令，开始充值流程"""
+# === /PDF (管理员) - 支持选择司机 ===
+def pdf_start(update, context):
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
-        update.message.reply_text("⛔ You do not have permission for this command.")
-        return ConversationHandler.END
+        return update.message.reply_text("❌ You are not an admin.")
     
-    # 获取所有司机列表
-    drivers = []
-    for driver_id in driver_accounts.keys():
+    logger.info(f"Admin {user_id} started PDF generation process")
+    
+    # 创建司机选择键盘
+    keyboard = []
+    pdf_state[user_id] = {}
+    
+    # 添加"所有司机"选项
+    keyboard.append([InlineKeyboardButton("📊 All Drivers", callback_data="pdf_all")])
+    
+    # 添加单个司机选项
+    for uid in driver_accounts.keys():
         try:
-            chat = bot.get_chat(driver_id)
+            chat = bot.get_chat(uid)
             name = f"@{chat.username}" if chat.username else chat.first_name
-            drivers.append(f"{name} ({driver_id})")
-        except:
-            drivers.append(f"User {driver_id}")
-            
-    if not drivers:
+            keyboard.append([InlineKeyboardButton(f"👤 {name}", callback_data=f"pdf_{uid}")])
+            pdf_state[user_id][f"pdf_{uid}"] = uid
+        except Exception as e:
+            logger.error(f"Error getting chat for user {uid}: {str(e)}")
+            name = f"User {uid}"
+            keyboard.append([InlineKeyboardButton(f"👤 {name}", callback_data=f"pdf_{uid}")])
+            pdf_state[user_id][f"pdf_{uid}"] = uid
+
+    if len(keyboard) <= 1:  # 只有"所有司机"选项
+        update.message.reply_text("❌ No drivers found.")
+        return
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    update.message.reply_text(
+        "🧾 Select driver for PDF report:",
+        reply_markup=reply_markup
+    )
+
+def pdf_button_callback(update, context):
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    if user_id not in ADMIN_IDS:
+        query.answer("❌ You are not an admin.")
+        return
+    
+    query.answer()  # 通知Telegram已处理回调
+    
+    callback_data = query.data
+    logger.info(f"Admin {user_id} selected: {callback_data}")
+    
+    # 处理"所有司机"选项
+    if callback_data == "pdf_all":
+        query.edit_message_text("🔄 Generating PDF reports for all drivers. This may take a moment...")
+        generate_all_pdfs(query)
+        return
+    
+    # 处理单个司机选项
+    if user_id in pdf_state and callback_data in pdf_state[user_id]:
+        driver_id = pdf_state[user_id][callback_data]
+        query.edit_message_text(f"🔄 Generating PDF report. This may take a moment...")
+        generate_single_pdf(query, driver_id)
+    else:
+        query.edit_message_text("❌ Invalid selection or session expired.")
+
+def generate_all_pdfs(query):
+    """生成所有司机的PDF报告"""
+    try:
+        # Create temp directory for PDFs
+        temp_dir = tempfile.mkdtemp()
+        
+        # Generate PDFs
+        pdf_files = generate_all_drivers_pdf(
+            driver_logs, 
+            driver_salaries, 
+            driver_accounts, 
+            bot, 
+            temp_dir
+        )
+        
+        if not pdf_files:
+            query.edit_message_text("❌ No driver data available to generate PDFs.")
+            return
+        
+        # Send each PDF
+        for pdf_file in pdf_files:
+            try:
+                with open(pdf_file, 'rb') as f:
+                    bot.send_document(
+                        chat_id=query.message.chat_id,
+                        document=f,
+                        filename=os.path.basename(pdf_file),
+                        caption="Driver Report"
+                    )
+            except Exception as e:
+                logger.error(f"Error sending PDF: {str(e)}")
+                bot.send_message(
+                    chat_id=query.message.chat_id,
+                    text=f"❌ Error sending PDF: {str(e)}"
+                )
+        
+        query.edit_message_text(f"✅ Generated {len(pdf_files)} PDF reports.")
+        
+    except Exception as e:
+        logger.error(f"PDF generation error: {str(e)}")
+        logger.exception(e)
+        query.edit_message_text(f"❌ Error generating PDFs: {str(e)}")
+
+def generate_single_pdf(query, driver_id):
+    """生成单个司机的PDF报告"""
+    try:
+        # Create temp directory for PDF
+        temp_dir = tempfile.mkdtemp()
+        
+        # Generate PDF
+        pdf_file = generate_single_driver_pdf(
+            driver_id, 
+            driver_logs, 
+            driver_salaries, 
+            driver_accounts, 
+            bot, 
+            temp_dir
+        )
+        
+        if not pdf_file:
+            query.edit_message_text("❌ No data available to generate PDF.")
+            return
+        
+        # Send PDF
+        try:
+            with open(pdf_file, 'rb') as f:
+                bot.send_document(
+                    chat_id=query.message.chat_id,
+                    document=f,
+                    filename=os.path.basename(pdf_file),
+                    caption="Driver Report"
+                )
+            query.edit_message_text("✅ PDF report generated successfully.")
+        except Exception as e:
+            logger.error(f"Error sending PDF: {str(e)}")
+            query.edit_message_text(f"❌ Error sending PDF: {str(e)}")
+        
+    except Exception as e:
+        logger.error(f"PDF generation error: {str(e)}")
+        logger.exception(e)
+        query.edit_message_text(f"❌ Error generating PDF: {str(e)}")
+
+# === /topup (交互流程管理员专用) ===
+def topup_start(update, context):
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        return
+    
+    logger.info(f"Admin {user_id} started topup process")
+    
+    keyboard = []
+    topup_state[user_id] = {}
+    for uid in driver_accounts:
+        try:
+            chat = bot.get_chat(uid)
+            name = f"@{chat.username}" if chat.username else chat.first_name
+            keyboard.append([name])
+            topup_state[user_id][name] = uid
+        except Exception as e:
+            logger.error(f"Error getting chat for user {uid}: {str(e)}")
+            name = f"User {uid}"
+            keyboard.append([name])
+            topup_state[user_id][name] = uid
+
+    if not keyboard:
         update.message.reply_text("❌ No drivers found.")
         return ConversationHandler.END
-        
-    # 发送司机列表供选择
-    keyboard = [[driver] for driver in drivers]
+
     update.message.reply_text(
-        "👤 Select the driver to top up:",
+        "👤 Select driver to top up:",
         reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True)
     )
     return TOPUP_USER
 
 def topup_user(update, context):
-    """处理管理员选择的司机"""
     admin_id = update.effective_user.id
-    selected_text = update.message.text
+    selected = update.message.text.strip()
     
-    try:
-        # 从文本中提取司机ID
-        uid = int(selected_text.split('(')[-1].split(')')[0])
-        context.user_data["topup_uid"] = uid
-        update.message.reply_text("💰 Enter top-up amount:")
-        return TOPUP_AMOUNT
-    except:
-        update.message.reply_text("❌ Invalid selection. Please select a driver from the list.")
-        return TOPUP_USER
+    logger.info(f"Admin {admin_id} selected: {selected}")
+
+    if admin_id not in topup_state or selected not in topup_state[admin_id]:
+        update.message.reply_text("❌ Invalid selection.")
+        return ConversationHandler.END
+
+    context.user_data["topup_uid"] = topup_state[admin_id][selected]
+    update.message.reply_text("💰 Enter amount (RM):", reply_markup=ReplyKeyboardRemove())
+    return TOPUP_AMOUNT
 
 def topup_amount(update, context):
-    """处理管理员输入的充值金额"""
     admin_id = update.effective_user.id
     try:
         amount = float(update.message.text.strip())
@@ -966,8 +1009,7 @@ def topup_amount(update, context):
             return ConversationHandler.END
             
         driver_accounts.setdefault(uid, {"balance": 0.0, "claims": [], "topup_history": []})
-        # 注意：余额增加和历史记录添加现在由db_mongo.add_topup原子化处理
-        # driver_accounts[uid]["balance"] += amount
+        driver_accounts[uid]["balance"] += amount
         
         # 记录充值历史
         today = datetime.datetime.now(tz).strftime("%Y-%m-%d")
@@ -976,21 +1018,7 @@ def topup_amount(update, context):
             "amount": amount,
             "admin": admin_id
         }
-        # 注意：历史记录添加现在由db_mongo.add_topup原子化处理
-        # driver_accounts[uid]["topup_history"].append(topup_record)
-        
-        # 保存到数据库 - 使用更高效的单用户更新方法
-        try:
-            db_mongo.add_topup(uid, topup_record)
-            logger.info(f"管理员 {admin_id} 为用户 {uid} 充值 {amount} 的记录已保存到数据库")
-            # 更新内存中的余额，以便立即显示正确余额
-            driver_accounts[uid]["balance"] += amount
-            driver_accounts[uid]["topup_history"].append(topup_record)
-        except Exception as e:
-            logger.error(f"保存充值记录到数据库失败: {str(e)}")
-            # 如果数据库保存失败，需要考虑回滚内存操作或通知管理员
-            update.message.reply_text("❌ Database error during topup. Please check logs.")
-            return ConversationHandler.END
+        driver_accounts[uid]["topup_history"].append(topup_record)
         
         try:
             chat = bot.get_chat(uid)
@@ -1006,16 +1034,10 @@ def topup_amount(update, context):
     except Exception as e:
         logger.error(f"Topup error: {str(e)}")
         update.message.reply_text("❌ An error occurred during topup.")
-        
-    # 清理状态
-    if "topup_uid" in context.user_data:
-        del context.user_data["topup_uid"]
-        
     return ConversationHandler.END
 
 # === /claim 分阶段 ===
 def claim_start(update, context):
-    """处理 /claim 命令，开始报销流程"""
     user_id = update.effective_user.id
     username = update.effective_user.username or str(user_id)
     
@@ -1029,7 +1051,6 @@ def claim_start(update, context):
     return CLAIM_TYPE
 
 def claim_type(update, context):
-    """处理用户选择的报销类型"""
     user_id = update.effective_user.id
     username = update.effective_user.username or str(user_id)
     text = update.message.text.lower()
@@ -1044,7 +1065,6 @@ def claim_type(update, context):
     return CLAIM_AMOUNT
 
 def claim_other_type(update, context):
-    """处理用户输入的自定义报销类型"""
     user_id = update.effective_user.id
     username = update.effective_user.username or str(user_id)
     claim_state[user_id]["type"] = update.message.text
@@ -1055,7 +1075,6 @@ def claim_other_type(update, context):
     return CLAIM_AMOUNT
 
 def claim_amount(update, context):
-    """处理用户输入的报销金额"""
     user_id = update.effective_user.id
     username = update.effective_user.username or str(user_id)
     try:
@@ -1075,7 +1094,6 @@ def claim_amount(update, context):
         return CLAIM_AMOUNT
 
 def claim_proof(update, context):
-    """处理用户发送的报销凭证照片"""
     user_id = update.effective_user.id
     username = update.effective_user.username or str(user_id)
 
@@ -1091,42 +1109,23 @@ def claim_proof(update, context):
     }
 
     driver_accounts.setdefault(user_id, {"balance": 0.0, "claims": [], "topup_history": []})
-    # 注意：余额减少和报销记录添加现在由db_mongo.add_claim原子化处理
-    # driver_accounts[user_id]["claims"].append(entry)
-    # driver_accounts[user_id]["balance"] -= entry["amount"]
-
-    # 保存到数据库 - 使用更高效的单用户更新方法
-    try:
-        db_mongo.add_claim(user_id, entry)
-        logger.info(f"用户 {username} 的报销记录已保存到数据库")
-        # 更新内存中的余额和记录，以便立即显示正确信息
-        driver_accounts[user_id]["claims"].append(entry)
-        driver_accounts[user_id]["balance"] -= entry["amount"]
-    except Exception as e:
-        logger.error(f"保存报销记录到数据库失败: {str(e)}")
-        # 如果数据库保存失败，需要考虑回滚内存操作或通知用户
-        update.message.reply_text("❌ Database error during claim. Please check logs.")
-        return ConversationHandler.END
+    driver_accounts[user_id]["claims"].append(entry)
+    driver_accounts[user_id]["balance"] -= entry["amount"]
 
     response = f"✅ RM{entry['amount']} claimed for {entry['type']} on {entry['date']}."
     update.message.reply_text(response)
     
     logger.info(f"User {username} completed claim: {response}")
-    
-    # 清理状态
-    if user_id in claim_state:
-        del claim_state[user_id]
 
     return ConversationHandler.END
 
 def cancel(update, context):
-    """处理取消操作"""
     user_id = update.effective_user.id
     username = update.effective_user.username or str(user_id)
     
-    update.message.reply_text("❌ Operation cancelled.", reply_markup=ReplyKeyboardRemove())
+    update.message.reply_text("❌ Operation cancelled.")
     
-    # 清理所有可能的状态
+    # 清理状态
     if user_id in claim_state:
         del claim_state[user_id]
     if user_id in topup_state:
@@ -1135,91 +1134,19 @@ def cancel(update, context):
         del pdf_state[user_id]
     if user_id in salary_state:
         del salary_state[user_id]
-    if "topup_uid" in context.user_data:
-        del context.user_data["topup_uid"]
-    if "salary_driver_id" in context.user_data:
-        del context.user_data["salary_driver_id"]
     
     logger.info(f"User {username} cancelled operation")
     
     return ConversationHandler.END
 
-# === 数据迁移和导出命令 (管理员) ===
-def migrate_data(update, context):
-    """将内存数据迁移到数据库 (管理员命令)"""
-    user_id = update.effective_user.id
-    if user_id not in ADMIN_IDS:
-        update.message.reply_text("⛔ 您没有权限执行此操作")
-        return
-    
-    try:
-        # 保存所有数据到数据库
-        db_mongo.save_driver_logs(driver_logs)
-        db_mongo.save_driver_salaries(driver_salaries)
-        db_mongo.save_driver_accounts(driver_accounts)
-        update.message.reply_text("✅ 数据迁移成功")
-        logger.info(f"管理员 {user_id} 执行了数据迁移")
-    except Exception as e:
-        update.message.reply_text(f"❌ 数据迁移失败: {str(e)}")
-        logger.error(f"数据迁移失败: {str(e)}")
-
-def export_data(update, context):
-    """导出数据为JSON文件 (管理员命令)"""
-    user_id = update.effective_user.id
-    if user_id not in ADMIN_IDS:
-        update.message.reply_text("⛔ 您没有权限执行此操作")
-        return
-    
-    try:
-        # 创建临时文件保存数据
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False, encoding='utf-8') as logs_file:
-            json.dump(driver_logs, logs_file, ensure_ascii=False, indent=2)
-            logs_path = logs_file.name
-            
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False, encoding='utf-8') as salaries_file:
-            json.dump(driver_salaries, salaries_file, ensure_ascii=False, indent=2)
-            salaries_path = salaries_file.name
-            
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False, encoding='utf-8') as accounts_file:
-            json.dump(driver_accounts, accounts_file, ensure_ascii=False, indent=2)
-            accounts_path = accounts_file.name
-        
-        # 发送文件
-        update.message.reply_text("📤 正在发送数据备份文件...")
-        context.bot.send_document(chat_id=user_id, document=open(logs_path, 'rb'), filename='driver_logs.json')
-        context.bot.send_document(chat_id=user_id, document=open(salaries_path, 'rb'), filename='driver_salaries.json')
-        context.bot.send_document(chat_id=user_id, document=open(accounts_path, 'rb'), filename='driver_accounts.json')
-        
-        update.message.reply_text("✅ 数据导出成功")
-        logger.info(f"管理员 {user_id} 导出了数据备份")
-        
-        # 清理临时文件
-        os.unlink(logs_path)
-        os.unlink(salaries_path)
-        os.unlink(accounts_path)
-    except Exception as e:
-        update.message.reply_text(f"❌ 数据导出失败: {str(e)}")
-        logger.error(f"数据导出失败: {str(e)}")
-
-# === 错误处理 ===
-def error_handler(update, context):
-    """处理发生的错误"""
-    logger.error(f"Update {update} caused error {context.error}")
-    traceback.print_exc()  # 打印完整的错误堆栈信息
-    # 可以在这里添加向管理员发送错误通知的逻辑
-    if update and update.effective_message:
-        update.effective_message.reply_text("❌ An unexpected error occurred. Please try again later or contact admin.")
-
-# === Webhook 设置 ===
+# === Webhook ===
 @app.route(f"/{TOKEN}", methods=["POST"])
 def webhook():
-    """处理来自Telegram的Webhook请求"""
     update = Update.de_json(request.get_json(force=True), bot)
     dispatcher.process_update(update)
     return "ok"
 
-# === Dispatcher 注册命令和会话处理器 ===
-# 基本命令
+# === Dispatcher 注册 ===
 dispatcher.add_handler(CommandHandler("start", start))
 dispatcher.add_handler(CommandHandler("clockin", clockin))
 dispatcher.add_handler(CommandHandler("clockout", clockout))
@@ -1227,18 +1154,10 @@ dispatcher.add_handler(CommandHandler("offday", offday))
 dispatcher.add_handler(CommandHandler("balance", balance))
 dispatcher.add_handler(CommandHandler("check", check))
 dispatcher.add_handler(CommandHandler("viewclaims", viewclaims))
+dispatcher.add_handler(CommandHandler("PDF", pdf_start))
+dispatcher.add_handler(CallbackQueryHandler(pdf_button_callback, pattern=r'^pdf_'))
 
-# PDF 生成会话
-dispatcher.add_handler(ConversationHandler(
-    entry_points=[CommandHandler("PDF", pdf_start)],
-    states={
-        PDF_SELECT_DRIVER: [CallbackQueryHandler(pdf_button_callback, pattern=r'^pdf_')]
-    },
-    fallbacks=[CommandHandler("cancel", cancel)],
-    allow_reentry=True
-))
-
-# 薪资设置会话 (管理员)
+# === salary handler - 新增薪资设置处理器 ===
 dispatcher.add_handler(ConversationHandler(
     entry_points=[CommandHandler("salary", salary_start)],
     states={
@@ -1248,7 +1167,7 @@ dispatcher.add_handler(ConversationHandler(
     fallbacks=[CommandHandler("cancel", cancel)],
 ))
 
-# 充值会话 (管理员)
+# === topup handler ===
 dispatcher.add_handler(ConversationHandler(
     entry_points=[CommandHandler("topup", topup_start)],
     states={
@@ -1258,7 +1177,7 @@ dispatcher.add_handler(ConversationHandler(
     fallbacks=[CommandHandler("cancel", cancel)],
 ))
 
-# 报销会话
+# === claim handler ===
 dispatcher.add_handler(ConversationHandler(
     entry_points=[CommandHandler("claim", claim_start)],
     states={
@@ -1270,33 +1189,10 @@ dispatcher.add_handler(ConversationHandler(
     fallbacks=[CommandHandler("cancel", cancel)],
 ))
 
-# 管理员命令
-dispatcher.add_handler(CommandHandler("migrate", migrate_data))
-dispatcher.add_handler(CommandHandler("export", export_data))
-
-# 注册错误处理器
+# === 注册错误处理器 ===
 dispatcher.add_error_handler(error_handler)
 
-# === 应用关闭时保存数据 (可选) ===
-@app.teardown_appcontext
-def save_data_on_shutdown(exception=None):
-    """在应用关闭时尝试保存数据到数据库 (最佳实践)"""
-    try:
-        # 注意：频繁修改的数据已在操作时保存，这里可以作为最后保障
-        # 如果需要确保所有最新状态都保存，可以再次调用保存函数
-        # db_mongo.save_driver_logs(driver_logs)
-        # db_mongo.save_driver_salaries(driver_salaries)
-        # db_mongo.save_driver_accounts(driver_accounts)
-        logger.info("应用关闭，数据已在操作时保存到MongoDB")
-    except Exception as e:
-        logger.error(f"应用关闭时尝试保存数据失败: {str(e)}")
-
-# === 启动 Flask 应用 ===
+# === Run ===
 if __name__ == "__main__":
-    logger.info("Bot server started with MongoDB integration.")
-    # 使用gunicorn等WSGI服务器部署时，不会执行这里的app.run
-    # Render通常会使用Procfile或启动命令来运行gunicorn
-    # 例如: gunicorn clock_bot_mongo:app
-    # 本地测试时可以取消注释下一行
-    # app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-
+    logger.info("Bot server started.")
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
