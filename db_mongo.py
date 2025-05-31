@@ -1,5 +1,5 @@
 """
-MongoDB数据库连接和操作模块 (完整修复版)
+MongoDB数据库连接和操作模块 (最终修复版)
 """
 
 from pymongo import MongoClient
@@ -7,7 +7,8 @@ from pymongo.errors import AutoReconnect, ConnectionFailure, ServerSelectionTime
 import os
 import logging
 import time
-import ssl  # 添加SSL支持
+import ssl
+import datetime  # 添加datetime导入
 
 # 设置日志
 logging.basicConfig(
@@ -34,7 +35,7 @@ def create_mongo_client():
         try:
             logger.info(f"尝试连接MongoDB (尝试 {attempt+1}/{retries})")
             
-            # 使用更稳定的连接选项
+            # 使用更稳定的连接选项 - 修复参数冲突
             client = MongoClient(
                 MONGO_URI,
                 connectTimeoutMS=30000,
@@ -44,7 +45,6 @@ def create_mongo_client():
                 w="majority",
                 tls=True,  # 强制使用TLS
                 tlsAllowInvalidCertificates=False,  # 严格证书验证
-                tlsInsecure=False,  # 不跳过主机名验证
                 ssl_cert_reqs=ssl.CERT_REQUIRED  # 要求证书验证
             )
             
