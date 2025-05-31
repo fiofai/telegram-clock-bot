@@ -1208,3 +1208,20 @@ dispatcher.add_error_handler(error_handler)
 if __name__ == "__main__":
     logger.info("Bot server started.")
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
+
+# === PingDB 测试命令，用于测试 MongoDB 写入是否成功 ===
+def pingdb(update, context):
+    try:
+        test_data = {
+            "test": True,
+            "username": update.effective_user.username or "unknown",
+            "timestamp": datetime.datetime.now(tz)
+        }
+        db.test_collection.insert_one(test_data)
+        update.message.reply_text("✅ MongoDB insert success!")
+    except Exception as e:
+        update.message.reply_text(f"❌ MongoDB error: {str(e)}")
+
+# === 注册 /pingdb 指令 ===
+dispatcher.add_handler(CommandHandler("pingdb", pingdb))
