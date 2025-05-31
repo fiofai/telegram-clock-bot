@@ -10,6 +10,24 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# 强制使用 URI 中的参数
+MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://yesclub0802:OWMjMxjzMPHGfPoA@cluster0.fy6uhn1.mongodb.net/clock_bot_db?retryWrites=true&w=majority&tls=true&tlsAllowInvalidCertificates=true&ssl_cert_reqs=NONE")
+
+try:
+    client = MongoClient(
+        MONGO_URI,
+        connectTimeoutMS=30000,
+        socketTimeoutMS=30000,
+        serverSelectionTimeoutMS=30000,
+        tls=True,
+        tlsAllowInvalidCertificates=True
+    )
+    db = client.get_default_database()
+    logger.info("MongoDB连接成功，当前数据库: %s", db.name)
+except Exception as e:
+    logger.error(f"MongoDB连接失败: {str(e)}")
+    db = None
+
 # 从环境变量获取MongoDB连接字符串
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://yesclub0802:OWMjMxjzMPHGfPoA@cluster0.fy6uhn1.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0&tlsAllowInvalidCertificates=true")
 DB_NAME = "clock_bot_db"
