@@ -1,50 +1,38 @@
 """
-MongoDB数据库连接和操作模块（安全版，支持重试 + 环境变量 + TLS）
+MongoDB数据库连接和操作模块 (修复警告版)
 """
 
-import os
-import time
-import logging
 from pymongo import MongoClient
-from pymongo.errors import ConnectionFailure
+import os
+import logging
 
-# 日志设置
+# 设置日志
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("db_mongo")
+logger = logging.getLogger(__name__)
 
-# 获取连接字符串（强烈建议从环境变量获取）
-MONGO_URI = os.environ.get("MONGO_URI")
-DB_NAME = os.environ.get("DB_NAME", "clock_bot_db")
+# 从环境变量获取MongoDB连接字符串
+MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://yesclub0802:OWMjMxjzMPHGfPoA@cluster0.fy6uhn1.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0&tlsAllowInvalidCertificates=true")
+DB_NAME = "clock_bot_db"
 
-# 初始化数据库引用
-db = None
-
-# === 安全连接 + 重试机制 ===
-logger.info("正在初始化MongoDB连接...")
-
-for attempt in range(5):
-    try:
-        logger.info(f"尝试连接MongoDB (尝试 {attempt + 1}/5)")
-        client = MongoClient(
-            MONGO_URI,
-            serverSelectionTimeoutMS=30000,
-            connectTimeoutMS=30000,
-            socketTimeoutMS=30000,
-            tls=True
-        )
-        client.server_info()  # 强制触发连接尝试
-        db = client[DB_NAME]
-        logger.info("✅ MongoDB连接成功")
-        break
-    except Exception as e:
-        logger.warning(f"⚠️ MongoDB连接失败 (尝试 {attempt + 1}/5): {str(e)}")
-        time.sleep(5 * (attempt + 1))
-else:
-    logger.error("❌ 无法连接MongoDB，请检查 MONGO_URI 是否正确或 Render 网络是否受限")
-
-# === 以下是数据库操作函数 ===
+# 创建MongoDB客户端连接
+try:
+    # 连接到MongoDB Atlas，使用连接字符串中的参数
+    client = MongoClient(
+        MONGO_URI,
+        connectTimeoutMS=30000,
+        socketTimeoutMS=30000,
+        serverSelectionTimeoutMS=30000
+    )
+    
+    # 选择数据库
+    db = client[DB_NAME]
+    logger.info("MongoDB连接成功")
+except Exception as e:
+    logger.error(f"MongoDB连接失败: {str(e)}")
+    db = None
 
 def get_driver_logs():
+    """获取所有司机打卡记录"""
     logs = {}
     if db is None:
         return logs
@@ -52,7 +40,9 @@ def get_driver_logs():
         for doc in db.driver_logs.find():
             user_id = doc["user_id"]
             date = doc["date"]
-            logs.setdefault(user_id, {})[date] = {
+            if user_id not in logs:
+                logs[user_id] = {}
+            logs[user_id][date] = {
                 "in": doc.get("clock_in", "N/A"),
                 "out": doc.get("clock_out", "N/A")
             }
@@ -61,6 +51,7 @@ def get_driver_logs():
     return logs
 
 def save_driver_logs(logs):
+    """保存司机打卡记录"""
     if db is None:
         return
     try:
@@ -78,6 +69,7 @@ def save_driver_logs(logs):
         logger.error(f"保存打卡记录失败: {str(e)}")
 
 def get_driver_salaries():
+    """获取所有司机薪资信息"""
     salaries = {}
     if db is None:
         return salaries
@@ -94,6 +86,7 @@ def get_driver_salaries():
     return salaries
 
 def save_driver_salaries(salaries):
+    """保存司机薪资信息"""
     if db is None:
         return
     try:
@@ -107,6 +100,7 @@ def save_driver_salaries(salaries):
         logger.error(f"保存薪资信息失败: {str(e)}")
 
 def get_driver_accounts():
+    """获取所有司机账户信息"""
     accounts = {}
     if db is None:
         return accounts
@@ -123,6 +117,7 @@ def get_driver_accounts():
     return accounts
 
 def save_driver_accounts(accounts):
+    """保存所有司机账户信息"""
     if db is None:
         return
     try:
@@ -136,6 +131,7 @@ def save_driver_accounts(accounts):
         logger.error(f"保存账户信息失败: {str(e)}")
 
 def add_claim(user_id, claim_data):
+    """添加报销记录"""
     if db is None:
         return
     try:
@@ -151,6 +147,7 @@ def add_claim(user_id, claim_data):
         logger.error(f"添加报销记录失败: {str(e)}")
 
 def add_topup(user_id, topup_data):
+    """添加充值记录"""
     if db is None:
         return
     try:
