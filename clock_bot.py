@@ -21,26 +21,42 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+from dotenv import load_dotenv
+from pathlib import Path
+
+# 加载环境变量
+env_path = Path('.') / '.env'
+load_dotenv(dotenv_path=env_path)
 
 # === 初始化设置 ===
 app = Flask(__name__)
 
-TOKEN = os.environ.get("TOKEN")
-ADMIN_IDS = [1165249082]
-DEFAULT_HOURLY_RATE = 20.00
-DEFAULT_MONTHLY_SALARY = 3500.00
-WORKING_DAYS_PER_MONTH = 22
-WORKING_HOURS_PER_DAY = 8
+TOKEN = os.getenv("TOKEN")
+ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "1165249082").split(",")))
+DEFAULT_HOURLY_RATE = float(os.getenv("DEFAULT_HOURLY_RATE", "20.00"))
+DEFAULT_MONTHLY_SALARY = float(os.getenv("DEFAULT_MONTHLY_SALARY", "3500.00"))
+WORKING_DAYS_PER_MONTH = int(os.getenv("WORKING_DAYS_PER_MONTH", "22"))
+WORKING_HOURS_PER_DAY = int(os.getenv("WORKING_HOURS_PER_DAY", "8"))
 
-bot = Bot(token=TOKEN)
-dispatcher = Dispatcher(bot, None, use_context=True)
+# 设置时区
+os.environ['TZ'] = os.getenv('TZ', 'Asia/Kuala_Lumpur')
 
 # === 日志设置 ===
 logging.basicConfig(
-    level=logging.INFO,
+    level=os.getenv('LOG_LEVEL', 'INFO'),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# === 状态常量 ===
+SALARY_SELECT_DRIVER = 0
+SALARY_ENTER_AMOUNT = 1
+TOPUP_USER = 0
+TOPUP_AMOUNT = 1
+CLAIM_TYPE = 0
+CLAIM_OTHER_TYPE = 1
+CLAIM_AMOUNT = 2
+CLAIM_PROOF = 3
 
 # === 数据库连接池 ===
 db_pool = None
@@ -113,14 +129,18 @@ def init_db():
 # === 辅助函数 ===
 def get_driver(user_id):
     """获取司机信息"""
-    with db_pool.getconn() as conn:
+    conn = get_db_connection()
+    try:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM drivers WHERE user_id = %s", (user_id,))
             return cur.fetchone()
+    finally:
+        release_db_connection(conn)
 
 def update_driver(user_id, username=None, first_name=None, balance=None, monthly_salary=None, total_hours=None):
     """更新司机信息"""
-    with db_pool.getconn() as conn:
+    conn = get_db_connection()
+    try:
         with conn.cursor() as cur:
             # 检查司机是否存在
             cur.execute("SELECT 1 FROM drivers WHERE user_id = %s", (user_id,))
@@ -156,6 +176,8 @@ def update_driver(user_id, username=None, first_name=None, balance=None, monthly
                 cur.execute(query, params)
             
             conn.commit()
+    finally:
+        release_db_connection(conn)
 
 def format_local_time(timestamp_str):
     try:
@@ -932,3 +954,21 @@ dispatcher.add_error_handler(error_handler)
 if __name__ == "__main__":
     logger.info("Starting bot...")
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
+# === 时间处理工具 ===
+def get_current_time():
+    """获取当前时间（马来西亚时区）"""
+    return datetime.datetime.now(pytz.timezone("Asia/Kuala_Lumpur"))
+
+def get_current_date():
+    """获取当前日期（马来西亚时区）"""
+    return get_current_time().date()
+
+def format_datetime(dt):
+    """格式化日期时间"""
+    if isinstance(dt, str):
+        try:
+            dt = datetime.datetime.strptime(dt, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return dt
+    return dt.strftime("%Y-%m-%d %H:%M")
