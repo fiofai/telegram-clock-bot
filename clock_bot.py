@@ -673,61 +673,105 @@ def viewclaims(update, context):
 
 # === 薪资设置功能 ===
 def salary_start(update, context):
-    if update.effective_user.id not in ADMIN_IDS:
-        return
-    
-    with db_pool.getconn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT user_id, first_name, username FROM drivers")
-            drivers = cur.fetchall()
-    
-    keyboard = [[f"{driver[1]} (ID: {driver[0]})"] for driver in drivers]
-    context.user_data['salary_drivers'] = {f"{driver[1]} (ID: {driver[0]})": driver[0] for driver in drivers}
-    
-    update.message.reply_text(
-        "👤 Select driver to set salary:",
-        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True)
-    )
-    return SALARY_SELECT_DRIVER
+    """开始设置薪资"""
+    try:
+        if update.effective_user.id not in ADMIN_IDS:
+            return
+        
+        # 清理之前的状态
+        context.user_data.clear()
+        
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT user_id, first_name, username FROM drivers")
+                drivers = cur.fetchall()
+        finally:
+            release_db_connection(conn)
+        
+        keyboard = [[f"{driver[1]} (ID: {driver[0]})"] for driver in drivers]
+        context.user_data['salary_drivers'] = {f"{driver[1]} (ID: {driver[0]})": driver[0] for driver in drivers}
+        
+        update.message.reply_text(
+            "👤 Select driver to set salary:",
+            reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True)
+        )
+        return SALARY_SELECT_DRIVER
+    except Exception as e:
+        logger.error(f"Error in salary_start: {str(e)}")
+        update.message.reply_text(
+            "❌ An error occurred. Please try /salary command again.",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return ConversationHandler.END
 
 def salary_select_driver(update, context):
-    selected = update.message.text
-    drivers = context.user_data.get('salary_drivers', {})
-    
-    if selected not in drivers:
-        update.message.reply_text("❌ Invalid selection.")
+    try:
+        selected = update.message.text
+        drivers = context.user_data.get('salary_drivers', {})
+        
+        if selected not in drivers:
+            update.message.reply_text(
+                "❌ Invalid selection.",
+                reply_markup=ReplyKeyboardRemove()
+            )
+            return ConversationHandler.END
+        
+        context.user_data['selected_driver'] = drivers[selected]
+        update.message.reply_text(
+            "💰 Enter monthly salary (RM):",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return SALARY_ENTER_AMOUNT
+    except Exception as e:
+        logger.error(f"Error in salary_select_driver: {str(e)}")
+        update.message.reply_text(
+            "❌ An error occurred. Please try /salary command again.",
+            reply_markup=ReplyKeyboardRemove()
+        )
         return ConversationHandler.END
-    
-    context.user_data['selected_driver'] = drivers[selected]
-    update.message.reply_text(
-        "💰 Enter monthly salary (RM):",
-        reply_markup=ReplyKeyboardRemove()
-    )
-    return SALARY_ENTER_AMOUNT
 
 def salary_enter_amount(update, context):
     try:
-        amount = float(update.message.text)
+        try:
+            amount = float(update.message.text)
+        except ValueError:
+            update.message.reply_text(
+                "❌ Please enter a valid number.",
+                reply_markup=ReplyKeyboardRemove()
+            )
+            return SALARY_ENTER_AMOUNT
+        
         driver_id = context.user_data.get('selected_driver')
         
-        with db_pool.getconn() as conn:
+        conn = get_db_connection()
+        try:
             with conn.cursor() as cur:
                 cur.execute(
                     "UPDATE drivers SET monthly_salary = %s WHERE user_id = %s",
                     (amount, driver_id)
                 )
                 conn.commit()
+        finally:
+            release_db_connection(conn)
         
         hourly_rate = calculate_hourly_rate(amount)
         update.message.reply_text(
             f"✅ Salary set to RM{amount:.2f}/month\n"
-            f"Hourly rate: RM{hourly_rate:.2f}"
+            f"Hourly rate: RM{hourly_rate:.2f}",
+            reply_markup=ReplyKeyboardRemove()
         )
-    except ValueError:
-        update.message.reply_text("❌ Please enter a valid number.")
-        return SALARY_ENTER_AMOUNT
-    
-    return ConversationHandler.END
+        
+        # 清理状态
+        context.user_data.clear()
+        return ConversationHandler.END
+    except Exception as e:
+        logger.error(f"Error in salary_enter_amount: {str(e)}")
+        update.message.reply_text(
+            "❌ An error occurred. Please try /salary command again.",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return ConversationHandler.END
 
 # === PDF 生成功能 ===
 def pdf_start(update, context):
@@ -829,46 +873,81 @@ def generate_single_pdf(query, driver_id):
 
 # === 充值功能 ===
 def topup_start(update, context):
-    if update.effective_user.id not in ADMIN_IDS:
-        return
-    
-    with db_pool.getconn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT user_id, first_name, username FROM drivers")
-            drivers = cur.fetchall()
-    
-    keyboard = [[f"{driver[1]} (ID: {driver[0]})"] for driver in drivers]
-    context.user_data['topup_drivers'] = {f"{driver[1]} (ID: {driver[0]})": driver[0] for driver in drivers}
-    
-    update.message.reply_text(
-        "👤 Select driver to top up:",
-        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True)
-    )
-    return TOPUP_USER
+    """开始充值流程"""
+    try:
+        if update.effective_user.id not in ADMIN_IDS:
+            return
+        
+        # 清理之前的状态
+        context.user_data.clear()
+        
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT user_id, first_name, username FROM drivers")
+                drivers = cur.fetchall()
+        finally:
+            release_db_connection(conn)
+        
+        keyboard = [[f"{driver[1]} (ID: {driver[0]})"] for driver in drivers]
+        context.user_data['topup_drivers'] = {f"{driver[1]} (ID: {driver[0]})": driver[0] for driver in drivers}
+        
+        update.message.reply_text(
+            "👤 Select driver to top up:",
+            reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True)
+        )
+        return TOPUP_USER
+    except Exception as e:
+        logger.error(f"Error in topup_start: {str(e)}")
+        update.message.reply_text(
+            "❌ An error occurred. Please try /topup command again.",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return ConversationHandler.END
 
 def topup_user(update, context):
-    selected = update.message.text
-    drivers = context.user_data.get('topup_drivers', {})
-    
-    if selected not in drivers:
-        update.message.reply_text("❌ Invalid selection.")
+    try:
+        selected = update.message.text
+        drivers = context.user_data.get('topup_drivers', {})
+        
+        if selected not in drivers:
+            update.message.reply_text(
+                "❌ Invalid selection.",
+                reply_markup=ReplyKeyboardRemove()
+            )
+            return ConversationHandler.END
+        
+        context.user_data['selected_driver'] = drivers[selected]
+        update.message.reply_text(
+            "💰 Enter amount (RM):",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return TOPUP_AMOUNT
+    except Exception as e:
+        logger.error(f"Error in topup_user: {str(e)}")
+        update.message.reply_text(
+            "❌ An error occurred. Please try /topup command again.",
+            reply_markup=ReplyKeyboardRemove()
+        )
         return ConversationHandler.END
-    
-    context.user_data['selected_driver'] = drivers[selected]
-    update.message.reply_text(
-        "💰 Enter amount (RM):",
-        reply_markup=ReplyKeyboardRemove()
-    )
-    return TOPUP_AMOUNT
 
 def topup_amount(update, context):
     try:
-        amount = float(update.message.text)
+        try:
+            amount = float(update.message.text)
+        except ValueError:
+            update.message.reply_text(
+                "❌ Please enter a valid number.",
+                reply_markup=ReplyKeyboardRemove()
+            )
+            return TOPUP_AMOUNT
+        
         driver_id = context.user_data.get('selected_driver')
         admin_id = update.effective_user.id
         date = datetime.datetime.now(pytz.timezone("Asia/Kuala_Lumpur")).strftime("%Y-%m-%d")
         
-        with db_pool.getconn() as conn:
+        conn = get_db_connection()
+        try:
             with conn.cursor() as cur:
                 # 更新余额
                 cur.execute(
@@ -882,83 +961,167 @@ def topup_amount(update, context):
                     (driver_id, amount, date, admin_id)
                 )
                 conn.commit()
+        finally:
+            release_db_connection(conn)
         
-        update.message.reply_text(f"✅ Topped up RM{amount:.2f}")
-    except ValueError:
-        update.message.reply_text("❌ Please enter a valid number.")
-        return TOPUP_AMOUNT
-    
-    return ConversationHandler.END
+        update.message.reply_text(
+            f"✅ Topped up RM{amount:.2f}",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        
+        # 清理状态
+        context.user_data.clear()
+        return ConversationHandler.END
+    except Exception as e:
+        logger.error(f"Error in topup_amount: {str(e)}")
+        update.message.reply_text(
+            "❌ An error occurred. Please try /topup command again.",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return ConversationHandler.END
 
 # === 报销功能 ===
 def claim_start(update, context):
-    user = update.effective_user
-    keyboard = [["Toll", "Petrol"], ["Parking", "Other"]]
-    update.message.reply_text(
-        "🚗 Select claim type:",
-        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True)
-    )
-    return CLAIM_TYPE
+    """开始报销流程"""
+    try:
+        # 清理之前的状态
+        context.user_data.clear()
+        
+        keyboard = [["Toll", "Petrol"], ["Parking", "Other"]]
+        update.message.reply_text(
+            "🚗 Select claim type:",
+            reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True)
+        )
+        return CLAIM_TYPE
+    except Exception as e:
+        logger.error(f"Error in claim_start: {str(e)}")
+        update.message.reply_text(
+            "❌ An error occurred. Please try /claim command again.",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return ConversationHandler.END
 
 def claim_type(update, context):
-    claim_type = update.message.text
-    context.user_data['claim_type'] = claim_type
-    
-    if claim_type.lower() == "other":
-        update.message.reply_text("✍️ Please describe the claim type:")
-        return CLAIM_OTHER_TYPE
-    
-    update.message.reply_text("💰 Enter amount (RM):")
-    return CLAIM_AMOUNT
+    try:
+        claim_type = update.message.text
+        context.user_data['claim_type'] = claim_type
+        
+        if claim_type.lower() == "other":
+            update.message.reply_text(
+                "✍️ Please describe the claim type:",
+                reply_markup=ReplyKeyboardRemove()
+            )
+            return CLAIM_OTHER_TYPE
+        
+        update.message.reply_text(
+            "💰 Enter amount (RM):",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return CLAIM_AMOUNT
+    except Exception as e:
+        logger.error(f"Error in claim_type: {str(e)}")
+        update.message.reply_text(
+            "❌ An error occurred. Please try /claim command again.",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return ConversationHandler.END
 
 def claim_other_type(update, context):
-    context.user_data['claim_type'] = update.message.text
-    update.message.reply_text("💰 Enter amount (RM):")
-    return CLAIM_AMOUNT
+    try:
+        context.user_data['claim_type'] = update.message.text
+        update.message.reply_text(
+            "💰 Enter amount (RM):",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return CLAIM_AMOUNT
+    except Exception as e:
+        logger.error(f"Error in claim_other_type: {str(e)}")
+        update.message.reply_text(
+            "❌ An error occurred. Please try /claim command again.",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return ConversationHandler.END
 
 def claim_amount(update, context):
     try:
-        amount = float(update.message.text)
+        try:
+            amount = float(update.message.text)
+        except ValueError:
+            update.message.reply_text(
+                "❌ Please enter a valid number.",
+                reply_markup=ReplyKeyboardRemove()
+            )
+            return CLAIM_AMOUNT
+            
         context.user_data['claim_amount'] = amount
         update.message.reply_text("📎 Please send a photo of the receipt:")
         return CLAIM_PROOF
-    except ValueError:
-        update.message.reply_text("❌ Please enter a valid number.")
-        return CLAIM_AMOUNT
+    except Exception as e:
+        logger.error(f"Error in claim_amount: {str(e)}")
+        update.message.reply_text(
+            "❌ An error occurred. Please try /claim command again.",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return ConversationHandler.END
 
 def claim_proof(update, context):
-    user = update.effective_user
-    photo_file = update.message.photo[-1].file_id
-    date = datetime.datetime.now(pytz.timezone("Asia/Kuala_Lumpur")).strftime("%Y-%m-%d")
-    
-    with db_pool.getconn() as conn:
-        with conn.cursor() as cur:
-            # 记录报销
-            cur.execute(
-                "INSERT INTO claims (user_id, type, amount, date, photo_file_id) "
-                "VALUES (%s, %s, %s, %s, %s)",
-                (user.id, context.user_data['claim_type'], 
-                 context.user_data['claim_amount'], date, photo_file)
-            )
-            
-            # 扣除余额
-            cur.execute(
-                "UPDATE drivers SET balance = balance - %s WHERE user_id = %s",
-                (context.user_data['claim_amount'], user.id)
-            )
-            conn.commit()
-    
-    update.message.reply_text(
-        f"✅ Claim submitted for {context.user_data['claim_type']}: "
-        f"RM{context.user_data['claim_amount']:.2f}"
-    )
-    return ConversationHandler.END
+    try:
+        user = update.effective_user
+        photo_file = update.message.photo[-1].file_id
+        date = datetime.datetime.now(pytz.timezone("Asia/Kuala_Lumpur")).strftime("%Y-%m-%d")
+        
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                # 记录报销
+                cur.execute(
+                    "INSERT INTO claims (user_id, type, amount, date, photo_file_id) "
+                    "VALUES (%s, %s, %s, %s, %s)",
+                    (user.id, context.user_data['claim_type'], 
+                     context.user_data['claim_amount'], date, photo_file)
+                )
+                
+                # 扣除余额
+                cur.execute(
+                    "UPDATE drivers SET balance = balance - %s WHERE user_id = %s",
+                    (context.user_data['claim_amount'], user.id)
+                )
+                conn.commit()
+        finally:
+            release_db_connection(conn)
+        
+        update.message.reply_text(
+            f"✅ Claim submitted for {context.user_data['claim_type']}: "
+            f"RM{context.user_data['claim_amount']:.2f}",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        
+        # 清理状态
+        context.user_data.clear()
+        return ConversationHandler.END
+    except Exception as e:
+        logger.error(f"Error in claim_proof: {str(e)}")
+        update.message.reply_text(
+            "❌ An error occurred. Please try /claim command again.",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return ConversationHandler.END
 
 def cancel(update, context):
-    update.message.reply_text(
-        "❌ Operation cancelled",
-        reply_markup=ReplyKeyboardRemove()
-    )
+    """取消当前操作"""
+    try:
+        # 清理状态
+        context.user_data.clear()
+        update.message.reply_text(
+            "❌ Operation cancelled",
+            reply_markup=ReplyKeyboardRemove()
+        )
+    except Exception as e:
+        logger.error(f"Error in cancel: {str(e)}")
+        update.message.reply_text(
+            "❌ An error occurred while cancelling.",
+            reply_markup=ReplyKeyboardRemove()
+        )
     return ConversationHandler.END
 
 def error_handler(update, context):
@@ -1262,100 +1425,146 @@ def validate_date(date_str):
 
 def paid_start(update, context):
     """开始PAID命令处理"""
-    if update.effective_user.id not in ADMIN_IDS:
-        return
-    
-    conn = get_db_connection()
     try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT d.user_id, d.first_name, d.username, d.monthly_salary 
-                FROM drivers d
-            """)
-            drivers = cur.fetchall()
-    finally:
-        release_db_connection(conn)
-    
-    # 过滤掉未设置月薪的员工
-    valid_drivers = [d for d in drivers if d[3] is not None and d[3] > 0]
-    
-    if not valid_drivers:
+        if update.effective_user.id not in ADMIN_IDS:
+            return
+        
+        # 清理之前可能存在的状态
+        context.user_data.clear()
+        
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT d.user_id, d.first_name, d.username, d.monthly_salary 
+                    FROM drivers d
+                """)
+                drivers = cur.fetchall()
+        finally:
+            release_db_connection(conn)
+        
+        # 过滤掉未设置月薪的员工
+        valid_drivers = [d for d in drivers if d[3] is not None and d[3] > 0]
+        
+        if not valid_drivers:
+            update.message.reply_text(
+                "❌ No drivers found with salary set.\n"
+                "Please set salary first using /salary command."
+            )
+            return ConversationHandler.END
+        
+        keyboard = [[f"{d[1]} (ID: {d[0]}) - RM{d[3]:.2f}/month"] for d in valid_drivers]
+        context.user_data['paid_drivers'] = {f"{d[1]} (ID: {d[0]}) - RM{d[3]:.2f}/month": d[0] for d in valid_drivers}
+        
         update.message.reply_text(
-            "❌ No drivers found with salary set.\n"
-            "Please set salary first using /salary command."
+            "👤 Select driver to view payment summary:",
+            reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True)
+        )
+        return PAID_SELECT_DRIVER
+    except Exception as e:
+        logger.error(f"Error in paid_start: {str(e)}")
+        update.message.reply_text(
+            "❌ An error occurred. Please try /paid command again.",
+            reply_markup=ReplyKeyboardRemove()
         )
         return ConversationHandler.END
-    
-    keyboard = [[f"{d[1]} (ID: {d[0]}) - RM{d[3]:.2f}/month"] for d in valid_drivers]
-    context.user_data['paid_drivers'] = {f"{d[1]} (ID: {d[0]}) - RM{d[3]:.2f}/month": d[0] for d in valid_drivers}
-    
-    update.message.reply_text(
-        "👤 Select driver to view payment summary:",
-        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True)
-    )
-    return PAID_SELECT_DRIVER
 
 def paid_select_driver(update, context):
     """处理PAID命令选择的员工"""
-    selected = update.message.text
-    drivers = context.user_data.get('paid_drivers', {})
-    
-    if selected not in drivers:
-        update.message.reply_text("❌ Invalid selection.")
+    try:
+        selected = update.message.text
+        drivers = context.user_data.get('paid_drivers', {})
+        
+        if selected not in drivers:
+            update.message.reply_text(
+                "❌ Invalid selection.",
+                reply_markup=ReplyKeyboardRemove()
+            )
+            return ConversationHandler.END
+        
+        context.user_data['selected_driver_id'] = drivers[selected]
+        update.message.reply_text(
+            "📅 Enter start date (DD/MM/YYYY):",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return PAID_START_DATE
+    except Exception as e:
+        logger.error(f"Error in paid_select_driver: {str(e)}")
+        update.message.reply_text(
+            "❌ An error occurred. Please try /paid command again.",
+            reply_markup=ReplyKeyboardRemove()
+        )
         return ConversationHandler.END
-    
-    context.user_data['selected_driver_id'] = drivers[selected]
-    update.message.reply_text(
-        "📅 Enter start date (DD/MM/YYYY):",
-        reply_markup=ReplyKeyboardRemove()
-    )
-    return PAID_START_DATE
 
 def paid_start_date(update, context):
     """处理开始日期输入"""
-    start_date = validate_date(update.message.text)
-    if not start_date:
+    try:
+        start_date = validate_date(update.message.text)
+        if not start_date:
+            update.message.reply_text(
+                "❌ Invalid date format. Please use DD/MM/YYYY\n"
+                "Example: 01/03/2024"
+            )
+            return PAID_START_DATE
+        
+        context.user_data['start_date'] = start_date
+        update.message.reply_text("📅 Enter end date (DD/MM/YYYY):")
+        return PAID_END_DATE
+    except Exception as e:
+        logger.error(f"Error in paid_start_date: {str(e)}")
         update.message.reply_text(
-            "❌ Invalid date format. Please use DD/MM/YYYY\n"
-            "Example: 01/03/2024"
+            "❌ An error occurred. Please try /paid command again.",
+            reply_markup=ReplyKeyboardRemove()
         )
-        return PAID_START_DATE
-    
-    context.user_data['start_date'] = start_date
-    update.message.reply_text("📅 Enter end date (DD/MM/YYYY):")
-    return PAID_END_DATE
+        return ConversationHandler.END
 
 def paid_end_date(update, context):
     """处理结束日期输入并显示结果"""
-    end_date = validate_date(update.message.text)
-    if not end_date:
-        update.message.reply_text(
-            "❌ Invalid date format. Please use DD/MM/YYYY\n"
-            "Example: 31/03/2024"
+    try:
+        end_date = validate_date(update.message.text)
+        if not end_date:
+            update.message.reply_text(
+                "❌ Invalid date format. Please use DD/MM/YYYY\n"
+                "Example: 31/03/2024"
+            )
+            return PAID_END_DATE
+        
+        start_date = context.user_data.get('start_date')
+        if end_date < start_date:
+            update.message.reply_text("❌ End date must be after start date.")
+            return PAID_END_DATE
+        
+        driver_id = context.user_data.get('selected_driver_id')
+        summary = calculate_work_summary_with_date_range(driver_id, start_date, end_date)
+        
+        if not summary:
+            update.message.reply_text(
+                "❌ Failed to calculate summary.",
+                reply_markup=ReplyKeyboardRemove()
+            )
+            return ConversationHandler.END
+        
+        message = (
+            f"📊 Payment Summary for {summary['name']}\n\n"
+            f"📅 Period: {summary['start_date'].strftime('%d/%m/%Y')} - "
+            f"{summary['end_date'].strftime('%d/%m/%Y')}\n\n"
+            f"🗓 Total Working Days: {summary['total_days']}\n"
+            f"⏰ Total Hours: {format_duration(summary['total_hours'])}\n"
+            f"💰 Hourly Rate: RM{summary['hourly_rate']:.2f}\n"
+            f"💵 Total Salary: RM{summary['total_salary']:.2f}"
         )
-        return PAID_END_DATE
-    
-    start_date = context.user_data.get('start_date')
-    if end_date < start_date:
-        update.message.reply_text("❌ End date must be after start date.")
-        return PAID_END_DATE
-    
-    driver_id = context.user_data.get('selected_driver_id')
-    summary = calculate_work_summary_with_date_range(driver_id, start_date, end_date)
-    
-    if not summary:
-        update.message.reply_text("❌ Failed to calculate summary.")
+        
+        update.message.reply_text(
+            message,
+            reply_markup=ReplyKeyboardRemove()
+        )
+        # 清理状态
+        context.user_data.clear()
         return ConversationHandler.END
-    
-    message = (
-        f"📊 Payment Summary for {summary['name']}\n\n"
-        f"📅 Period: {summary['start_date'].strftime('%d/%m/%Y')} - "
-        f"{summary['end_date'].strftime('%d/%m/%Y')}\n\n"
-        f"🗓 Total Working Days: {summary['total_days']}\n"
-        f"⏰ Total Hours: {format_duration(summary['total_hours'])}\n"
-        f"💰 Hourly Rate: RM{summary['hourly_rate']:.2f}\n"
-        f"💵 Total Salary: RM{summary['total_salary']:.2f}"
-    )
-    
-    update.message.reply_text(message)
-    return ConversationHandler.END
+    except Exception as e:
+        logger.error(f"Error in paid_end_date: {str(e)}")
+        update.message.reply_text(
+            "❌ An error occurred. Please try /paid command again.",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return ConversationHandler.END
