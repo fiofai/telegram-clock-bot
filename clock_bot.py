@@ -934,11 +934,28 @@ else:
     # 获取应用URL
     render_external_url = os.environ.get("RENDER_EXTERNAL_URL")
     if render_external_url:
+        # 确保 URL 格式正确
         webhook_url = f"https://{render_external_url}/webhook"
-        logger.info(f"Setting webhook URL to: {webhook_url}")
-        bot.set_webhook(webhook_url)
+        if not webhook_url.startswith('https://'):
+            webhook_url = f"https://{webhook_url}"
+        
+        try:
+            logger.info(f"Attempting to set webhook URL to: {webhook_url}")
+            # 先删除任何现有的 webhook
+            bot.delete_webhook()
+            # 设置新的 webhook
+            bot.set_webhook(
+                url=webhook_url,
+                allowed_updates=['message', 'callback_query'],
+                drop_pending_updates=True
+            )
+            logger.info("Webhook set successfully")
+        except Exception as e:
+            logger.error(f"Failed to set webhook: {str(e)}")
+            raise
     else:
-        logger.warning("RENDER_EXTERNAL_URL not found, webhook not set")
+        logger.error("RENDER_EXTERNAL_URL not found, cannot set webhook")
+        raise ValueError("RENDER_EXTERNAL_URL environment variable is required")
 
 # === 时间处理工具 ===
 def get_current_time():
