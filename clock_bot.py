@@ -23,6 +23,8 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from dotenv import load_dotenv
 from pathlib import Path
+import time
+import atexit
 
 # === 初始化设置 ===
 app = Flask(__name__)
@@ -66,16 +68,19 @@ CLAIM_PROOF = 3
 db_pool = None
 
 def init_db():
-    """初始化数据库连接池和表结构"""
+    """初始化数据库和表结构"""
     global db_pool
     try:
+        # 创建数据库连接池，设置合理的连接数
         db_pool = psycopg2.pool.SimpleConnectionPool(
             minconn=1,
-            maxconn=10,
+            maxconn=20,  # 增加最大连接数
             dsn=os.environ.get("DATABASE_URL")
         )
+        logger.info("Database connection pool created successfully")
         
-        with db_pool.getconn() as conn:
+        conn = get_db_connection()
+        try:
             with conn.cursor() as cur:
                 # 创建司机表
                 cur.execute("""
@@ -85,7 +90,8 @@ def init_db():
                     first_name TEXT,
                     balance FLOAT DEFAULT 0.0,
                     monthly_salary FLOAT DEFAULT 3500.0,
-                    total_hours FLOAT DEFAULT 0.0
+                    total_hours FLOAT DEFAULT 0.0,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 )
                 """)
                 
@@ -95,9 +101,10 @@ def init_db():
                     id SERIAL PRIMARY KEY,
                     user_id BIGINT REFERENCES drivers(user_id),
                     date DATE NOT NULL,
-                    clock_in TEXT,
-                    clock_out TEXT,
+                    clock_in TIMESTAMP WITH TIME ZONE,
+                    clock_out TIMESTAMP WITH TIME ZONE,
                     is_off BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(user_id, date)
                 )
                 """)
@@ -108,8 +115,9 @@ def init_db():
                     id SERIAL PRIMARY KEY,
                     user_id BIGINT REFERENCES drivers(user_id),
                     amount FLOAT NOT NULL,
-                    date TEXT NOT NULL,
-                    admin_id BIGINT
+                    date DATE NOT NULL,
+                    admin_id BIGINT,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 )
                 """)
                 
@@ -120,12 +128,17 @@ def init_db():
                     user_id BIGINT REFERENCES drivers(user_id),
                     type TEXT NOT NULL,
                     amount FLOAT NOT NULL,
-                    date TEXT NOT NULL,
-                    photo_file_id TEXT
+                    date DATE NOT NULL,
+                    photo_file_id TEXT,
+                    status TEXT DEFAULT 'pending',
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 )
                 """)
                 conn.commit()
-        logger.info("Database initialized successfully")
+                logger.info("Database tables created successfully")
+        finally:
+            release_db_connection(conn)
+            
     except Exception as e:
         logger.error(f"Database initialization failed: {e}")
         raise
@@ -133,13 +146,39 @@ def init_db():
 # === 数据库工具函数 ===
 def get_db_connection():
     """获取数据库连接"""
-    conn = db_pool.getconn()
-    return conn
+    try:
+        conn = db_pool.getconn()
+        return conn
+    except psycopg2.pool.PoolError:
+        logger.error("Connection pool exhausted, waiting for available connection...")
+        # 等待一会儿再试
+        time.sleep(1)
+        try:
+            conn = db_pool.getconn()
+            return conn
+        except Exception as e:
+            logger.error(f"Failed to get database connection: {e}")
+            raise
 
 def release_db_connection(conn):
     """释放数据库连接回连接池"""
-    if conn:
-        db_pool.putconn(conn)
+    try:
+        if conn:
+            db_pool.putconn(conn)
+    except Exception as e:
+        logger.error(f"Error releasing database connection: {e}")
+
+def close_all_db_connections():
+    """关闭所有数据库连接"""
+    try:
+        if db_pool:
+            db_pool.closeall()
+            logger.info("All database connections closed")
+    except Exception as e:
+        logger.error(f"Error closing database connections: {e}")
+
+# 确保在应用退出时关闭所有数据库连接
+atexit.register(close_all_db_connections)
 
 def get_driver(user_id):
     """获取司机信息"""
@@ -936,11 +975,23 @@ def error_handler(update, context):
 # === Webhook ===
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    if not dispatcher:
-        init_bot()
-    update = Update.de_json(request.get_json(force=True), bot)
-    dispatcher.process_update(update)
-    return "ok"
+    try:
+        if not dispatcher:
+            init_bot()
+        update = Update.de_json(request.get_json(force=True), bot)
+        dispatcher.process_update(update)
+        return "ok"
+    except Exception as e:
+        logger.error(f"Error processing webhook: {e}")
+        return "error", 500
+    finally:
+        # 确保每个请求结束后释放所有空闲连接
+        if db_pool:
+            try:
+                while db_pool.putconn(db_pool.getconn(), close=True):
+                    pass
+            except psycopg2.pool.PoolError:
+                pass
 
 # === 健康检查端点 ===
 @app.route("/health")
