@@ -665,12 +665,17 @@ def pdf_start(update, context):
             drivers = cur.fetchall()
     
     keyboard = [
-        [InlineKeyboardButton("📊 All Drivers", callback_data="all")],
-        *[[InlineKeyboardButton(
-            f"@{driver[2]}" if driver[2] else driver[1],
-            callback_data=str(driver[0])
-        ] for driver in drivers]
+        [InlineKeyboardButton("📊 All Drivers", callback_data="all")]
     ]
+    
+    # Add individual driver buttons
+    for driver in drivers:
+        keyboard.append([
+            InlineKeyboardButton(
+                f"@{driver[2]}" if driver[2] else driver[1],
+                callback_data=str(driver[0])
+            )
+        ])
     
     update.message.reply_text(
         "🧾 Select driver for PDF report:",
