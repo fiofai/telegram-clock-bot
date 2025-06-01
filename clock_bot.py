@@ -63,6 +63,9 @@ CLAIM_TYPE = 0
 CLAIM_OTHER_TYPE = 1
 CLAIM_AMOUNT = 2
 CLAIM_PROOF = 3
+PAID_SELECT_DRIVER = 0
+PAID_START_DATE = 1  # 新增开始日期状态
+PAID_END_DATE = 2    # 新增结束日期状态
 
 # === 数据库连接池 ===
 db_pool = None
@@ -1130,7 +1133,214 @@ def init_bot():
         fallbacks=[CommandHandler("cancel", cancel)],
     ))
 
+    # 更新PAID命令处理器
+    dispatcher.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("paid", paid_start)],
+        states={
+            PAID_SELECT_DRIVER: [MessageHandler(Filters.text & ~Filters.command, paid_select_driver)],
+            PAID_START_DATE: [MessageHandler(Filters.text & ~Filters.command, paid_start_date)],
+            PAID_END_DATE: [MessageHandler(Filters.text & ~Filters.command, paid_end_date)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    ))
+
     # 注册错误处理器
     dispatcher.add_error_handler(error_handler)
     
     logger.info("Bot handlers initialized successfully")
+
+def calculate_work_summary(user_id):
+    """计算员工工作统计"""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            # 获取员工信息
+            cur.execute("""
+                SELECT first_name, username, monthly_salary, total_hours 
+                FROM drivers 
+                WHERE user_id = %s
+            """, (user_id,))
+            driver = cur.fetchone()
+            
+            if not driver:
+                return None
+                
+            # 计算工作天数
+            cur.execute("""
+                SELECT COUNT(*) 
+                FROM clock_logs 
+                WHERE user_id = %s 
+                AND clock_in IS NOT NULL 
+                AND clock_out IS NOT NULL
+            """, (user_id,))
+            total_days = cur.fetchone()[0]
+            
+            # 计算总工时和工资
+            first_name, username, monthly_salary, total_hours = driver
+            hourly_rate = calculate_hourly_rate(monthly_salary)
+            total_salary = total_hours * hourly_rate
+            
+            return {
+                'name': f"@{username}" if username else first_name,
+                'total_days': total_days,
+                'total_hours': total_hours,
+                'hourly_rate': hourly_rate,
+                'total_salary': total_salary
+            }
+    finally:
+        release_db_connection(conn)
+
+def calculate_work_summary_with_date_range(user_id, start_date, end_date):
+    """计算指定日期范围内的员工工作统计"""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            # 获取员工信息
+            cur.execute("""
+                SELECT first_name, username, monthly_salary, total_hours 
+                FROM drivers 
+                WHERE user_id = %s
+            """, (user_id,))
+            driver = cur.fetchone()
+            
+            if not driver:
+                return None
+                
+            # 计算指定日期范围内的工作天数和工时
+            cur.execute("""
+                SELECT COUNT(*), SUM(
+                    EXTRACT(EPOCH FROM (clock_out - clock_in)) / 3600
+                )
+                FROM clock_logs 
+                WHERE user_id = %s 
+                AND date BETWEEN %s AND %s
+                AND clock_in IS NOT NULL 
+                AND clock_out IS NOT NULL
+            """, (user_id, start_date, end_date))
+            result = cur.fetchone()
+            total_days = result[0] or 0
+            period_hours = result[1] or 0
+            
+            # 获取员工信息
+            first_name, username, monthly_salary, _ = driver
+            hourly_rate = calculate_hourly_rate(monthly_salary)
+            total_salary = period_hours * hourly_rate
+            
+            return {
+                'name': f"@{username}" if username else first_name,
+                'total_days': total_days,
+                'total_hours': period_hours,
+                'hourly_rate': hourly_rate,
+                'total_salary': total_salary,
+                'start_date': start_date,
+                'end_date': end_date
+            }
+    finally:
+        release_db_connection(conn)
+
+def validate_date(date_str):
+    """验证日期格式 (DD/MM/YYYY)"""
+    try:
+        return datetime.datetime.strptime(date_str, "%d/%m/%Y").date()
+    except ValueError:
+        return None
+
+def paid_start(update, context):
+    """开始PAID命令处理"""
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT d.user_id, d.first_name, d.username, d.monthly_salary 
+                FROM drivers d
+            """)
+            drivers = cur.fetchall()
+    finally:
+        release_db_connection(conn)
+    
+    # 过滤掉未设置月薪的员工
+    valid_drivers = [d for d in drivers if d[3] is not None and d[3] > 0]
+    
+    if not valid_drivers:
+        update.message.reply_text(
+            "❌ No drivers found with salary set.\n"
+            "Please set salary first using /salary command."
+        )
+        return ConversationHandler.END
+    
+    keyboard = [[f"{d[1]} (ID: {d[0]}) - RM{d[3]:.2f}/month"] for d in valid_drivers]
+    context.user_data['paid_drivers'] = {f"{d[1]} (ID: {d[0]}) - RM{d[3]:.2f}/month": d[0] for d in valid_drivers}
+    
+    update.message.reply_text(
+        "👤 Select driver to view payment summary:",
+        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True)
+    )
+    return PAID_SELECT_DRIVER
+
+def paid_select_driver(update, context):
+    """处理PAID命令选择的员工"""
+    selected = update.message.text
+    drivers = context.user_data.get('paid_drivers', {})
+    
+    if selected not in drivers:
+        update.message.reply_text("❌ Invalid selection.")
+        return ConversationHandler.END
+    
+    context.user_data['selected_driver_id'] = drivers[selected]
+    update.message.reply_text(
+        "📅 Enter start date (DD/MM/YYYY):",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    return PAID_START_DATE
+
+def paid_start_date(update, context):
+    """处理开始日期输入"""
+    start_date = validate_date(update.message.text)
+    if not start_date:
+        update.message.reply_text(
+            "❌ Invalid date format. Please use DD/MM/YYYY\n"
+            "Example: 01/03/2024"
+        )
+        return PAID_START_DATE
+    
+    context.user_data['start_date'] = start_date
+    update.message.reply_text("📅 Enter end date (DD/MM/YYYY):")
+    return PAID_END_DATE
+
+def paid_end_date(update, context):
+    """处理结束日期输入并显示结果"""
+    end_date = validate_date(update.message.text)
+    if not end_date:
+        update.message.reply_text(
+            "❌ Invalid date format. Please use DD/MM/YYYY\n"
+            "Example: 31/03/2024"
+        )
+        return PAID_END_DATE
+    
+    start_date = context.user_data.get('start_date')
+    if end_date < start_date:
+        update.message.reply_text("❌ End date must be after start date.")
+        return PAID_END_DATE
+    
+    driver_id = context.user_data.get('selected_driver_id')
+    summary = calculate_work_summary_with_date_range(driver_id, start_date, end_date)
+    
+    if not summary:
+        update.message.reply_text("❌ Failed to calculate summary.")
+        return ConversationHandler.END
+    
+    message = (
+        f"📊 Payment Summary for {summary['name']}\n\n"
+        f"📅 Period: {summary['start_date'].strftime('%d/%m/%Y')} - "
+        f"{summary['end_date'].strftime('%d/%m/%Y')}\n\n"
+        f"🗓 Total Working Days: {summary['total_days']}\n"
+        f"⏰ Total Hours: {format_duration(summary['total_hours'])}\n"
+        f"💰 Hourly Rate: RM{summary['hourly_rate']:.2f}\n"
+        f"💵 Total Salary: RM{summary['total_salary']:.2f}"
+    )
+    
+    update.message.reply_text(message)
+    return ConversationHandler.END
