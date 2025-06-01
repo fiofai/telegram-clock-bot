@@ -908,6 +908,11 @@ def webhook():
     dispatcher.process_update(update)
     return "ok"
 
+# === 健康检查端点 ===
+@app.route("/health")
+def health():
+    return "OK", 200
+
 # === 初始化数据库和处理器 ===
 init_db()
 
@@ -957,8 +962,20 @@ dispatcher.add_error_handler(error_handler)
 
 # === 启动应用 ===
 if __name__ == "__main__":
-    logger.info("Starting bot...")
+    # 本地开发时使用
+    logger.info("Starting bot in development mode...")
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+else:
+    # Gunicorn 生产环境使用
+    logger.info("Starting bot in production mode...")
+    # 获取应用URL
+    render_external_url = os.environ.get("RENDER_EXTERNAL_URL")
+    if render_external_url:
+        webhook_url = f"https://{render_external_url}/webhook"
+        logger.info(f"Setting webhook URL to: {webhook_url}")
+        bot.set_webhook(webhook_url)
+    else:
+        logger.warning("RENDER_EXTERNAL_URL not found, webhook not set")
 
 # === 时间处理工具 ===
 def get_current_time():
