@@ -65,6 +65,7 @@ python clock_bot.py
 - `/topup` - Top up driver's balance
 - `/viewclaims` - View recent claims
 - `/salary` - Set driver's salary
+- `/paid` - View driver's work summary and payment details
 
 ## Database Schema
 
