@@ -24,12 +24,12 @@ from reportlab.pdfbase.ttfonts import TTFont
 from dotenv import load_dotenv
 from pathlib import Path
 
+# === 初始化设置 ===
+app = Flask(__name__)
+
 # 加载环境变量
 env_path = Path('.') / '.env'
 load_dotenv(dotenv_path=env_path)
-
-# === 初始化设置 ===
-app = Flask(__name__)
 
 TOKEN = os.getenv("TOKEN")
 ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "1165249082").split(",")))
@@ -47,6 +47,10 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# === Telegram Bot 设置 ===
+bot = Bot(token=TOKEN)
+dispatcher = None
 
 # === 状态常量 ===
 SALARY_SELECT_DRIVER = 0
@@ -904,6 +908,8 @@ def error_handler(update, context):
 # === Webhook ===
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    if not dispatcher:
+        init_bot()
     update = Update.de_json(request.get_json(force=True), bot)
     dispatcher.process_update(update)
     return "ok"
@@ -916,53 +922,10 @@ def health():
 # === 初始化数据库和处理器 ===
 init_db()
 
-# 注册命令处理器
-dispatcher.add_handler(CommandHandler("start", start))
-dispatcher.add_handler(CommandHandler("clockin", clockin))
-dispatcher.add_handler(CommandHandler("clockout", clockout))
-dispatcher.add_handler(CommandHandler("offday", offday))
-dispatcher.add_handler(CommandHandler("balance", balance))
-dispatcher.add_handler(CommandHandler("check", check))
-dispatcher.add_handler(CommandHandler("viewclaims", viewclaims))
-dispatcher.add_handler(CommandHandler("PDF", pdf_start))
-dispatcher.add_handler(CallbackQueryHandler(pdf_button_callback, pattern=r'^all|\d+$'))
-
-# 注册对话处理器
-dispatcher.add_handler(ConversationHandler(
-    entry_points=[CommandHandler("salary", salary_start)],
-    states={
-        SALARY_SELECT_DRIVER: [MessageHandler(Filters.text & ~Filters.command, salary_select_driver)],
-        SALARY_ENTER_AMOUNT: [MessageHandler(Filters.text & ~Filters.command, salary_enter_amount)],
-    },
-    fallbacks=[CommandHandler("cancel", cancel)],
-))
-
-dispatcher.add_handler(ConversationHandler(
-    entry_points=[CommandHandler("topup", topup_start)],
-    states={
-        TOPUP_USER: [MessageHandler(Filters.text & ~Filters.command, topup_user)],
-        TOPUP_AMOUNT: [MessageHandler(Filters.text & ~Filters.command, topup_amount)],
-    },
-    fallbacks=[CommandHandler("cancel", cancel)],
-))
-
-dispatcher.add_handler(ConversationHandler(
-    entry_points=[CommandHandler("claim", claim_start)],
-    states={
-        CLAIM_TYPE: [MessageHandler(Filters.text & ~Filters.command, claim_type)],
-        CLAIM_OTHER_TYPE: [MessageHandler(Filters.text & ~Filters.command, claim_other_type)],
-        CLAIM_AMOUNT: [MessageHandler(Filters.text & ~Filters.command, claim_amount)],
-        CLAIM_PROOF: [MessageHandler(Filters.photo, claim_proof)],
-    },
-    fallbacks=[CommandHandler("cancel", cancel)],
-))
-
-# 注册错误处理器
-dispatcher.add_error_handler(error_handler)
-
 # === 启动应用 ===
 if __name__ == "__main__":
     # 本地开发时使用
+    init_bot()  # 初始化 bot
     logger.info("Starting bot in development mode...")
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
 else:
@@ -994,3 +957,54 @@ def format_datetime(dt):
         except ValueError:
             return dt
     return dt.strftime("%Y-%m-%d %H:%M")
+
+def init_bot():
+    """初始化 Telegram Bot 和 Dispatcher"""
+    global dispatcher
+    dispatcher = Dispatcher(bot, None, use_context=True)
+    
+    # 注册命令处理器
+    dispatcher.add_handler(CommandHandler("start", start))
+    dispatcher.add_handler(CommandHandler("clockin", clockin))
+    dispatcher.add_handler(CommandHandler("clockout", clockout))
+    dispatcher.add_handler(CommandHandler("offday", offday))
+    dispatcher.add_handler(CommandHandler("balance", balance))
+    dispatcher.add_handler(CommandHandler("check", check))
+    dispatcher.add_handler(CommandHandler("viewclaims", viewclaims))
+    dispatcher.add_handler(CommandHandler("PDF", pdf_start))
+    dispatcher.add_handler(CallbackQueryHandler(pdf_button_callback, pattern=r'^all|\d+$'))
+
+    # 注册对话处理器
+    dispatcher.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("salary", salary_start)],
+        states={
+            SALARY_SELECT_DRIVER: [MessageHandler(Filters.text & ~Filters.command, salary_select_driver)],
+            SALARY_ENTER_AMOUNT: [MessageHandler(Filters.text & ~Filters.command, salary_enter_amount)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    ))
+
+    dispatcher.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("topup", topup_start)],
+        states={
+            TOPUP_USER: [MessageHandler(Filters.text & ~Filters.command, topup_user)],
+            TOPUP_AMOUNT: [MessageHandler(Filters.text & ~Filters.command, topup_amount)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    ))
+
+    dispatcher.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("claim", claim_start)],
+        states={
+            CLAIM_TYPE: [MessageHandler(Filters.text & ~Filters.command, claim_type)],
+            CLAIM_OTHER_TYPE: [MessageHandler(Filters.text & ~Filters.command, claim_other_type)],
+            CLAIM_AMOUNT: [MessageHandler(Filters.text & ~Filters.command, claim_amount)],
+            CLAIM_PROOF: [MessageHandler(Filters.photo, claim_proof)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    ))
+
+    # 注册错误处理器
+    dispatcher.add_error_handler(error_handler)
+    
+    logger.info("Bot handlers initialized successfully")
