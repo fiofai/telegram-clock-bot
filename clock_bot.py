@@ -130,7 +130,17 @@ def init_db():
         logger.error(f"Database initialization failed: {e}")
         raise
 
-# === 辅助函数 ===
+# === 数据库工具函数 ===
+def get_db_connection():
+    """获取数据库连接"""
+    conn = db_pool.getconn()
+    return conn
+
+def release_db_connection(conn):
+    """释放数据库连接回连接池"""
+    if conn:
+        db_pool.putconn(conn)
+
 def get_driver(user_id):
     """获取司机信息"""
     conn = get_db_connection()
@@ -447,11 +457,12 @@ def start(update, context):
 
 def clockin(update, context):
     user = update.effective_user
-    now = datetime.datetime.now(pytz.timezone("Asia/Kuala_Lumpur"))
+    now = get_current_time()
     today = now.date()
     clock_time = now.strftime("%Y-%m-%d %H:%M:%S")
     
-    with db_pool.getconn() as conn:
+    conn = get_db_connection()
+    try:
         with conn.cursor() as cur:
             # 检查是否已有记录
             cur.execute(
@@ -471,16 +482,19 @@ def clockin(update, context):
                     (user.id, today, clock_time)
                 )
             conn.commit()
+    finally:
+        release_db_connection(conn)
     
     update.message.reply_text(f"✅ Clocked in at {format_local_time(clock_time)}")
 
 def clockout(update, context):
     user = update.effective_user
-    now = datetime.datetime.now(pytz.timezone("Asia/Kuala_Lumpur"))
+    now = get_current_time()
     today = now.date()
     clock_time = now.strftime("%Y-%m-%d %H:%M:%S")
     
-    with db_pool.getconn() as conn:
+    conn = get_db_connection()
+    try:
         with conn.cursor() as cur:
             # 检查是否已打卡
             cur.execute(
@@ -510,6 +524,8 @@ def clockout(update, context):
                 (hours_worked, user.id)
             )
             conn.commit()
+    finally:
+        release_db_connection(conn)
     
     time_str = format_duration(hours_worked)
     update.message.reply_text(
@@ -518,9 +534,10 @@ def clockout(update, context):
 
 def offday(update, context):
     user = update.effective_user
-    today = datetime.datetime.now(pytz.timezone("Asia/Kuala_Lumpur")).date()
+    today = get_current_date()
     
-    with db_pool.getconn() as conn:
+    conn = get_db_connection()
+    try:
         with conn.cursor() as cur:
             # 标记休息日
             cur.execute(
@@ -529,6 +546,8 @@ def offday(update, context):
                 (user.id, today)
             )
             conn.commit()
+    finally:
+        release_db_connection(conn)
     
     update.message.reply_text(f"📅 Marked {today} as off day.")
 
@@ -536,10 +555,13 @@ def balance(update, context):
     if update.effective_user.id not in ADMIN_IDS:
         return
     
-    with db_pool.getconn() as conn:
+    conn = get_db_connection()
+    try:
         with conn.cursor() as cur:
             cur.execute("SELECT user_id, first_name, username, balance FROM drivers")
             drivers = cur.fetchall()
+    finally:
+        release_db_connection(conn)
     
     msg = "📊 Driver Balances:\n"
     for driver in drivers:
@@ -552,9 +574,10 @@ def check(update, context):
     if update.effective_user.id not in ADMIN_IDS:
         return
     
-    today = datetime.datetime.now(pytz.timezone("Asia/Kuala_Lumpur")).date()
+    today = get_current_date()
     
-    with db_pool.getconn() as conn:
+    conn = get_db_connection()
+    try:
         with conn.cursor() as cur:
             cur.execute("""
             SELECT d.user_id, d.first_name, d.username, l.clock_in, l.clock_out, l.is_off
@@ -562,6 +585,8 @@ def check(update, context):
             LEFT JOIN clock_logs l ON d.user_id = l.user_id AND l.date = %s
             """, (today,))
             logs = cur.fetchall()
+    finally:
+        release_db_connection(conn)
     
     msg = "📄 Today's Status:\n"
     for log in logs:
@@ -581,7 +606,8 @@ def viewclaims(update, context):
     if update.effective_user.id not in ADMIN_IDS:
         return
     
-    with db_pool.getconn() as conn:
+    conn = get_db_connection()
+    try:
         with conn.cursor() as cur:
             cur.execute("""
             SELECT d.user_id, d.first_name, d.username, c.type, c.amount, c.date
@@ -591,6 +617,8 @@ def viewclaims(update, context):
             LIMIT 20
             """)
             claims = cur.fetchall()
+    finally:
+        release_db_connection(conn)
     
     msg = "📷 Recent Claims:\n"
     for claim in claims:
