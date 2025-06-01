@@ -1198,7 +1198,7 @@ def calculate_work_summary_with_date_range(user_id, start_date, end_date):
         with conn.cursor() as cur:
             # 获取员工信息
             cur.execute("""
-                SELECT first_name, username, monthly_salary, total_hours 
+                SELECT first_name, username, monthly_salary
                 FROM drivers 
                 WHERE user_id = %s
             """, (user_id,))
@@ -1206,36 +1206,50 @@ def calculate_work_summary_with_date_range(user_id, start_date, end_date):
             
             if not driver:
                 return None
-                
+            
             # 计算指定日期范围内的工作天数和工时
             cur.execute("""
-                SELECT COUNT(*), SUM(
-                    EXTRACT(EPOCH FROM (clock_out - clock_in)) / 3600
-                )
+                SELECT 
+                    COUNT(*) as total_days,
+                    COALESCE(
+                        SUM(
+                            CASE 
+                                WHEN clock_in IS NOT NULL AND clock_out IS NOT NULL 
+                                THEN EXTRACT(EPOCH FROM (clock_out::timestamp - clock_in::timestamp)) / 3600.0
+                                ELSE 0 
+                            END
+                        ),
+                        0
+                    ) as total_hours
                 FROM clock_logs 
                 WHERE user_id = %s 
                 AND date BETWEEN %s AND %s
+                AND NOT is_off
                 AND clock_in IS NOT NULL 
                 AND clock_out IS NOT NULL
             """, (user_id, start_date, end_date))
-            result = cur.fetchone()
-            total_days = result[0] or 0
-            period_hours = result[1] or 0
+            
+            total_days, total_hours = cur.fetchone()
+            total_days = total_days or 0
+            total_hours = float(total_hours or 0)
             
             # 获取员工信息
-            first_name, username, monthly_salary, _ = driver
+            first_name, username, monthly_salary = driver
             hourly_rate = calculate_hourly_rate(monthly_salary)
-            total_salary = period_hours * hourly_rate
+            total_salary = total_hours * hourly_rate
             
             return {
                 'name': f"@{username}" if username else first_name,
                 'total_days': total_days,
-                'total_hours': period_hours,
+                'total_hours': total_hours,
                 'hourly_rate': hourly_rate,
                 'total_salary': total_salary,
                 'start_date': start_date,
                 'end_date': end_date
             }
+    except Exception as e:
+        logger.error(f"Error in calculate_work_summary_with_date_range: {str(e)}")
+        return None
     finally:
         release_db_connection(conn)
 
