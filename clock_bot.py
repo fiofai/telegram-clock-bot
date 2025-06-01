@@ -931,31 +931,61 @@ if __name__ == "__main__":
 else:
     # Gunicorn 生产环境使用
     logger.info("Starting bot in production mode...")
-    # 获取应用URL
-    render_external_url = os.environ.get("RENDER_EXTERNAL_URL")
-    if render_external_url:
-        # 确保 URL 格式正确
-        webhook_url = f"https://{render_external_url}/webhook"
-        if not webhook_url.startswith('https://'):
-            webhook_url = f"https://{webhook_url}"
+    try:
+        # 获取应用URL
+        render_external_url = os.environ.get("RENDER_EXTERNAL_URL")
+        if not render_external_url:
+            logger.warning("RENDER_EXTERNAL_URL not found, trying to get RENDER_EXTERNAL_HOSTNAME")
+            render_external_url = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
         
-        try:
+        if render_external_url:
+            # 移除任何可能的 http:// 或 https:// 前缀
+            render_external_url = render_external_url.replace("http://", "").replace("https://", "")
+            # 构建完整的 webhook URL
+            webhook_url = f"https://{render_external_url}/webhook"
+            
             logger.info(f"Attempting to set webhook URL to: {webhook_url}")
-            # 先删除任何现有的 webhook
+            
+            # 先删除现有的 webhook
             bot.delete_webhook()
-            # 设置新的 webhook
-            bot.set_webhook(
+            
+            # 设置新的 webhook，使用最基本的配置
+            success = bot.set_webhook(
                 url=webhook_url,
-                allowed_updates=['message', 'callback_query'],
-                drop_pending_updates=True
+                max_connections=100
             )
-            logger.info("Webhook set successfully")
-        except Exception as e:
-            logger.error(f"Failed to set webhook: {str(e)}")
-            raise
-    else:
-        logger.error("RENDER_EXTERNAL_URL not found, cannot set webhook")
-        raise ValueError("RENDER_EXTERNAL_URL environment variable is required")
+            
+            if success:
+                logger.info("Webhook set successfully!")
+            else:
+                logger.error("Failed to set webhook")
+                raise ValueError("Webhook setup failed")
+                
+        else:
+            logger.error("No valid external URL found")
+            raise ValueError("No valid external URL environment variable found")
+            
+    except Exception as e:
+        logger.error(f"Error during webhook setup: {str(e)}")
+        logger.error(f"Full error: {traceback.format_exc()}")
+        raise
+
+# 添加一个路由来显示当前 webhook 状态
+@app.route("/webhook-status")
+def webhook_status():
+    try:
+        webhook_info = bot.get_webhook_info()
+        return {
+            "url": webhook_info.url,
+            "has_custom_certificate": webhook_info.has_custom_certificate,
+            "pending_update_count": webhook_info.pending_update_count,
+            "last_error_date": webhook_info.last_error_date,
+            "last_error_message": webhook_info.last_error_message,
+            "max_connections": webhook_info.max_connections,
+            "ip_address": webhook_info.ip_address
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 # === 时间处理工具 ===
 def get_current_time():
